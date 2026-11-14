@@ -316,6 +316,19 @@ details[open].areas summary svg{transform:rotate(90deg)}
 .tasks{margin:0;padding:0;list-style:none;display:grid;gap:4px}.tasks li{display:flex;gap:8px;font-size:13px;color:var(--soft)}.tasks li>span:first-child{color:var(--k)}
 .admin{--k:var(--warn)}
 .subcfg{padding:14px;border-radius:14px;border:1px solid var(--line2);background:var(--hover);margin-bottom:16px}
+.vivo{border-color:rgba(var(--tk-rgb),.5);box-shadow:0 0 calc(30px*var(--glow)) rgba(var(--tk-rgb),.12),var(--shadow)}
+.vivo h3 .dot{margin-right:2px}
+.vivo-empty{display:flex;gap:12px;align-items:center;justify-content:center;padding:28px;color:var(--muted);border:1px dashed var(--line);border-radius:16px}
+.vivo-grid{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:16px}
+.vivo-hu{padding:16px;border-radius:18px;background:var(--hover);border:1px solid var(--line2)}
+.vivo-hu .title{font-family:var(--display);font-size:16px;font-weight:600;margin-bottom:10px}
+.vivo-subs{display:grid;gap:10px;align-content:start}
+.vivo .subcard.open .vsh{padding:10px 14px 4px}
+.gherkin.mini li{font-size:12.5px;padding:7px 10px}.gherkin.mini em{font-style:normal;font:600 10px var(--display);color:var(--tk-soft)}
+.gherkin.mini{margin-top:8px}.gherkin.mini .k{min-width:0;margin:0 3px}
+.nuevo{animation:nuevo 3.5s ease-out 1;border-radius:8px}
+@keyframes nuevo{0%{background:rgba(var(--tk-rgb),.35);box-shadow:0 0 0 2px rgba(var(--tk-rgb),.6)}100%{background:transparent;box-shadow:none}}
+@media(max-width:900px){.vivo-grid{grid-template-columns:1fr}}
 .ux{--k:var(--ux)}.it{--k:var(--it)}.qa{--k:var(--qa)}
 .quote{font-size:13px;color:var(--muted);font-style:italic;border-left:2px solid var(--tk);padding:2px 0 2px 12px;margin-top:10px}
 [contenteditable]{outline:none;border-radius:6px;transition:background .15s}
@@ -453,7 +466,7 @@ const DEFAULTS = {
   modeloAudio: 'whisper-large-v3',
   glosario: 'Tokin, Arcor, PDV, punto de venta, distribuidor, Partners, GTM, UX, QA, IT, historia de usuario, criterio de aceptación, criterio de negocio, Figma, Jira, sprint, Vtex, combo, checkout, carrito, home, banner, cupón, promoción, 2x1, 3x2, billetera, Pedido fácil, Admin.'
 };
-const SEG_MS = 5 * 60 * 1000;            // la grabación se corta en tramos de 5 min
+const SEG_MS = 3 * 60 * 1000;            // la grabación se corta en tramos de 3 min (y la historia en vivo se actualiza con cada uno)
 const TIPOS = ['Refinamiento / Discovery', 'Reunión con equipo', 'Otra'];
 const AREAS = ['Producto', 'IT (Desarrollo)', 'UX', 'QA'];
 const DB_ROOT = 'refinamiento';
@@ -549,7 +562,7 @@ const Store = {
   },
   async guardar(s) {
     s.actualizado = Date.now(); CACHE[s.id] = s;
-    const data = clone({ ...s, imagenes: undefined, _imgsCargadas: undefined });
+    const data = clone({ ...s, imagenes: undefined, _imgsCargadas: undefined, _vivoCola: undefined });
     if (this.modo === 'firebase') await this.db.ref(DB_ROOT + '/sesiones/' + s.id).set(data);
     else { const all = this._localAll(); all[s.id] = data; this._localSet(all); }
   },
@@ -590,16 +603,17 @@ function normSesion(s) {
     analisisDiseno: s.analisisDiseno || '', transcripcion: s.transcripcion || '', notas: arr(s.notas),
     modoGrabacion: s.modoGrabacion || (navigator.mediaDevices?.getDisplayMedia ? 'virtual' : 'presencial'),
     consentimiento: !!s.consentimiento, duracionGrabada: s.duracionGrabada || 0, cantImagenes: s.cantImagenes || 0,
+    vivo: normVivo(s.vivo), vivoActivo: s.vivoActivo !== false,
     subActivas: s.subActivas !== false, subEquipos: arr(s.subEquipos).length ? arr(s.subEquipos) : EQUIPOS.map(e => e.k),
     resultado: s.resultado ? normRes(s.resultado) : null
   };
 }
 const pad2 = n => String(n).padStart(2, '0');
 const EQUIPOS = [
-  { k: 'UX', sigla: 'UX', nombre: 'UX', ic: 'pen', css: 'ux' },
-  { k: 'Back', sigla: 'BE', nombre: 'IT Back', ic: 'code', css: 'back' },
   { k: 'Front', sigla: 'FE', nombre: 'IT Front', ic: 'monitor', css: 'front' },
-  { k: 'Admin', sigla: 'ADM', nombre: 'Admin', ic: 'sliders', css: 'admin' }
+  { k: 'Back', sigla: 'BE', nombre: 'IT Back', ic: 'code', css: 'back' },
+  { k: 'Admin', sigla: 'ADM', nombre: 'Admin', ic: 'sliders', css: 'admin' },
+  { k: 'UX', sigla: 'UX', nombre: 'UX', ic: 'pen', css: 'ux' }
 ];
 const eqDe = x => EQUIPOS.find(e => (x || '').toLowerCase().includes(e.k.toLowerCase()) || (x || '').toUpperCase() === e.sigla) || null;
 function normSub(x) {
@@ -852,8 +866,8 @@ TAREA: partí la historia de usuario recibida en SUB-HISTORIAS, una por equipo, 
 - UX: entregable = diseño final en Figma (pantallas, estados, textos, mobile/desktop). Rol: el usuario final del diseño (PDV u operador del Admin).
 - Back: servicios, datos, reglas que se resuelven en back, integraciones, logs. Rol: el consumidor del servicio (ej. "tienda Tokin (Front)" o "Admin de Tokin").
 - Front: la tienda Tokin mobile/desktop (componentes, lógica de visualización, validaciones, errores, eventos GA4). Rol: PDV o usuario administrador del PDV.
-- Admin: el Admin de Tokin (carga, configuración, ABM, reportes internos). Rol: operador del Admin. Si la iniciativa NO toca el Admin, devolvé aplica=false con el motivo.
-- Una sub-historia por equipo pedido. Cada una se puede entregar y probar por ese equipo.
+- Admin: el Admin de Tokin (carga, configuración, ABM, reportes internos). Rol: operador del Admin.
+- SIEMPRE una sub-historia por cada equipo pedido (aplica=true), también Admin. Si en la reunión no se habló de lo que necesita ese equipo, armala con lo que se desprende de la historia madre y marcá lo que falte con [A DEFINIR] en "puntos_abiertos". Cada una se puede entregar y probar por ese equipo.
 - Criterios propios del equipo en Gherkin (2 a 5), con id CA-UX-01, CA-BE-01, CA-FE-01, CA-ADM-01. Citá en "refs" las RN-XX y CA-XX de la historia madre que cubre.
 - "tareas": checklist concreto del equipo (3 a 7 ítems).
 - "dependencias": qué necesita de otro equipo (ej. "Front depende de Back: endpoint de ahorro").
@@ -870,6 +884,10 @@ async function redactarSubs(s, modelo, maxOut, hu, extra = '') {
   ], { onWait: setGen, max: Math.min(maxOut, 4500), model: modelo });
   const orden = EQUIPOS.map(e => e.k);
   return arr(r.subs || r.subhistorias).map(normSub).filter(Boolean).sort((a, b) => orden.indexOf(a.equipo) - orden.indexOf(b.equipo));
+}
+function vivoRef(s) {
+  const v = s.vivo; if (!v) return '';
+  return `\n\nBORRADOR ARMADO EN VIVO DURANTE LA REUNIÓN (referencia; la transcripción manda):\n${JSON.stringify({ titulo: v.titulo, decisiones: v.decisiones, reglas: v.reglas.map(r => r.texto), dudas: v.dudas, subs: v.subs.map(x => ({ equipo: x.equipo, titulo: x.titulo })) })}`;
 }
 function minutaTexto(r) {
   return `MINUTA (para coherencia entre historias):
@@ -1123,6 +1141,144 @@ async function prbGrabar(fuente) {
 }
 
 function cerrarVozFlujos() { if (ENR) { clearInterval(ENR.timer); ENR.cap?.cerrar(); } ENR = null; PRB = null; }
+/* =====================================================================
+   HISTORIA EN VIVO: mientras se graba, con cada tramo transcripto el agente
+   actualiza un borrador de la HU general y de las HU por equipo.
+   ===================================================================== */
+function normVivo(v) {
+  if (!v || typeof v !== 'object') return null;
+  const L = x => arr(x).map(toStr).map(t => t.trim()).filter(Boolean), T = x => toStr(x ?? '').trim();
+  const orden = EQUIPOS.map(e => e.k);
+  return {
+    titulo: T(v.titulo), rol: T(v.rol), quiero: T(v.quiero), para: T(v.para), contexto: T(v.contexto),
+    decisiones: L(v.decisiones), dudas: L(v.dudas),
+    reglas: arr(v.reglas).map((r, j) => typeof r === 'string' ? { id: 'RN-' + pad2(j + 1), texto: r } : { id: T(r.id) || 'RN-' + pad2(j + 1), texto: T(r.texto) }).filter(r => r.texto),
+    criterios: arr(v.criterios).map((c, j) => typeof c === 'string' ? { id: 'CA-' + pad2(j + 1), escenario: '', dado: '', cuando: '', entonces: c } : { id: T(c.id) || 'CA-' + pad2(j + 1), escenario: T(c.escenario), dado: T(c.dado), cuando: T(c.cuando), entonces: T(c.entonces) }),
+    subs: arr(v.subs).map(x => { const eq = eqDe(T(x?.equipo)); if (!eq) return null; return { equipo: eq.k, titulo: T(x.titulo), quiero: T(x.quiero), tareas: L(x.tareas), criterios: arr(x.criterios).map((c, j) => typeof c === 'string' ? { id: `CA-${eq.sigla}-${pad2(j + 1)}`, dado: '', cuando: '', entonces: c } : { id: T(c.id) || `CA-${eq.sigla}-${pad2(j + 1)}`, dado: T(c.dado), cuando: T(c.cuando), entonces: T(c.entonces) }), dependencias: L(x.dependencias), abiertos: L(x.abiertos || x.puntos_abiertos) }; }).filter(Boolean).sort((a, b) => orden.indexOf(a.equipo) - orden.indexOf(b.equipo)),
+    tramos: +v.tramos || 0, actualizado: +v.actualizado || 0
+  };
+}
+const equiposSesion = s => (s.subEquipos?.length ? s.subEquipos : EQUIPOS.map(e => e.k));
+function sysVivo(s) {
+  const eqs = equiposSesion(s);
+  return sysBase(s) + `
+
+TAREA: mantenés un BORRADOR EN VIVO de la historia de usuario de la iniciativa mientras la reunión sigue. Recibís el borrador actual y el NUEVO fragmento de la transcripción.
+- Devolvé el borrador COMPLETO actualizado: sumá lo nuevo, corregí lo que se cambió en la charla y no borres lo anterior salvo que se haya descartado explícitamente.
+- Solo las decisiones van a reglas (RN-XX) y criterios (CA-XX, Gherkin). Las ideas sin decidir y lo que falta van a "dudas".
+- Lo que todavía no se habló queda como [A DEFINIR]. No inventes reglas ni números.
+- Sub-historias: SIEMPRE una por cada equipo pedido, en este orden: ${eqs.join(', ')}. Aunque todavía no se haya hablado de un equipo (por ejemplo Admin), incluila con título y "quiero" derivados de la historia general y lo que falte como [A DEFINIR] en "abiertos".
+  · Front: tienda Tokin mobile/desktop. · Back: servicios, datos, integraciones. · Admin: carga y configuración en el Admin de Tokin. · UX: diseño final en Figma.
+- Sé breve: es un borrador que se lee en vivo.
+
+ESQUEMA:
+{"titulo":"verbo en infinitivo + objeto + contexto","rol":"","quiero":"","para":"","contexto":"1-2 líneas","decisiones":[""],
+"reglas":[{"id":"RN-01","texto":""}],"criterios":[{"id":"CA-01","escenario":"","dado":"","cuando":"","entonces":""}],"dudas":[""],
+"subs":[{"equipo":"Front | Back | Admin | UX","titulo":"","quiero":"","tareas":[""],"criterios":[{"id":"CA-FE-01","dado":"","cuando":"","entonces":""}],"dependencias":[""],"abiertos":[""]}]}`;
+}
+function vivoClaves(v) {
+  if (!v) return new Set();
+  const k = [v.titulo, v.quiero, ...v.decisiones, ...v.dudas, ...v.reglas.map(r => r.texto), ...v.criterios.map(c => c.entonces)];
+  v.subs.forEach(sb => k.push(sb.equipo + '|' + sb.titulo, ...sb.tareas.map(t => sb.equipo + '|' + t), ...sb.criterios.map(c => sb.equipo + '|' + c.entonces)));
+  return new Set(k.filter(Boolean));
+}
+const VIVO_UI = {};   // por sesión: { estado, msg, nuevos:Set }
+function encolarVivo(s, fragmento, etiqueta) {
+  if (!fragmento?.trim() || !cfg.groqKey) return;
+  s._vivoCola = (s._vivoCola || Promise.resolve()).then(() => actualizarVivo(s, fragmento, etiqueta)).catch(() => { });
+  return s._vivoCola;
+}
+async function actualizarVivo(s, fragmento, etiqueta) {
+  const ui = VIVO_UI[s.id] = VIVO_UI[s.id] || {};
+  ui.estado = 'run'; ui.msg = `Actualizando con ${etiqueta}…`; refrescarVivo(s);
+  try {
+    const modelo = await modeloTexto(), T = tpmDe(modelo), maxOut = Math.min(3500, Math.floor(T * 0.35));
+    const actual = s.vivo ? clone({ ...s.vivo, tramos: undefined, actualizado: undefined }) : null;
+    const lugar = T - maxOut - estimTokens(sysVivo(s) + contextoTexto(s, false) + JSON.stringify(actual || {})) - 600;
+    const partes = estimTokens(fragmento) > lugar ? partir(fragmento, Math.max(3000, Math.floor(lugar * 3.4))) : [fragmento];
+    let borrador = actual;
+    for (let i = 0; i < partes.length; i++) {
+      const res = await chat([
+        { role: 'system', content: sysVivo(s) },
+        { role: 'user', content: `${contextoTexto(s, false)}\n\nBORRADOR ACTUAL:\n${borrador ? JSON.stringify(borrador) : '(todavía no hay borrador: crealo)'}\n\nNUEVO FRAGMENTO DE LA REUNIÓN (${etiqueta}${partes.length > 1 ? `, parte ${i + 1}/${partes.length}` : ''}):\n${partes[i]}` }
+      ], { onWait: m => { ui.msg = m; refrescarVivo(s); }, max: maxOut, model: modelo });
+      borrador = normVivo(res); delete borrador.tramos; delete borrador.actualizado;
+    }
+    const antes = vivoClaves(s.vivo);
+    s.vivo = normVivo({ ...borrador, tramos: (s.vivo?.tramos || 0) + 1, actualizado: Date.now() });
+    ui.nuevos = new Set([...vivoClaves(s.vivo)].filter(k => !antes.has(k)));
+    ui.estado = 'ok'; ui.msg = '';
+    await Store.guardar(s).catch(() => { });
+  } catch (e) { ui.estado = 'error'; ui.msg = 'No se pudo actualizar: ' + e.message; }
+  refrescarVivo(s);
+}
+async function vivoDesdeTranscripcion(s) {
+  const t = s.transcripcion.trim(); if (!t) return toast('No hay transcripción todavía.');
+  if (s.vivo && !confirm('Se rehace el borrador en vivo desde cero con toda la transcripción. ¿Seguimos?')) return;
+  s.vivo = null; VIVO_UI[s.id] = { estado: 'run', msg: 'Preparando…' }; refrescarVivo(s);
+  const partes = partir(t, 9000);
+  for (let i = 0; i < partes.length; i++) await encolarVivo(s, partes[i], `parte ${i + 1} de ${partes.length} de la transcripción`);
+}
+function refrescarVivo(s) {
+  if (S !== s || VISTA !== 'sesion') return;
+  const el = $('#vivo'); if (el) el.outerHTML = panelVivo(s);
+}
+function vivoMarkdown(s) {
+  const v = s.vivo; if (!v) return '';
+  const L = [`# [Borrador] ${v.titulo || s.titulo}`, '', `Como ${v.rol || '[A DEFINIR]'}`, `quiero ${v.quiero || '[A DEFINIR]'}`, `para ${v.para || '[A DEFINIR]'}.`, ''];
+  if (v.contexto) L.push(v.contexto, '');
+  if (v.decisiones.length) L.push('## Decisiones', ...v.decisiones.map(d => `- ${d}`), '');
+  if (v.reglas.length) L.push('## Reglas de negocio', ...v.reglas.map(r => `${r.id}: ${r.texto}`), '');
+  if (v.criterios.length) { L.push('## Criterios de aceptación'); v.criterios.forEach(c => { L.push(`${c.id} — ${c.escenario || 'Escenario'}`); if (c.dado) L.push(`  Dado que ${c.dado}`); if (c.cuando) L.push(`  Cuando ${c.cuando}`); L.push(`  Entonces ${c.entonces}`); }); L.push(''); }
+  if (v.dudas.length) L.push('## Dudas abiertas', ...v.dudas.map(d => `- ${d}`), '');
+  v.subs.forEach(sb => {
+    const eq = EQUIPOS.find(e => e.k === sb.equipo);
+    L.push(`## [${eq.nombre}] ${sb.titulo || '[A DEFINIR]'}`, `Quiero: ${sb.quiero || '[A DEFINIR]'}`);
+    if (sb.tareas.length) L.push('Tareas:', ...sb.tareas.map(t => `- [ ] ${t}`));
+    sb.criterios.forEach(c => L.push(`${c.id}: ${[c.dado && 'Dado que ' + c.dado, c.cuando && 'cuando ' + c.cuando, 'entonces ' + c.entonces].filter(Boolean).join(', ')}`));
+    if (sb.dependencias.length) L.push('Dependencias:', ...sb.dependencias.map(d => `- ${d}`));
+    if (sb.abiertos.length) L.push('Abiertos:', ...sb.abiertos.map(d => `- ${d}`));
+    L.push('');
+  });
+  return L.join('\n');
+}
+function panelVivo(s) {
+  const v = s.vivo, ui = VIVO_UI[s.id] || {}, nuevos = ui.nuevos || new Set();
+  const nv = (k) => nuevos.has(k) ? ' nuevo' : '';
+  const grabando = REC.activo && REC.sid === s.id;
+  const estado = ui.estado === 'run' ? `<span class="chip y"><span class="spin" style="width:12px;height:12px;border-width:2px"></span>${esc(ui.msg || 'Actualizando…')}</span>`
+    : ui.estado === 'error' ? `<span class="chip err">${esc(ui.msg)}</span>`
+      : v ? `<span class="chip ok">${ic('check')}Actualizado ${new Date(v.actualizado).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })} · ${v.tramos} ${v.tramos === 1 ? 'actualización' : 'actualizaciones'}</span>` : '';
+  const head = `<div class="chead"><div><h3><span class="dot ${grabando ? 'rec' : v ? 'live' : ''}"></span>Historia en vivo</h3><p class="sub">${s.vivoActivo === false ? 'Desactivada: activala en la tarjeta de grabación.' : grabando ? 'Se actualiza sola con cada tramo de la reunión (cada 3 minutos). Lo nuevo aparece resaltado.' : 'Se arma mientras grabás. También podés armarla con una transcripción pegada o importada.'}</p></div>
+      <div class="row" style="gap:6px">${estado}${v ? `<button class="btn sm" data-action="copiarVivo">${ic('copy')}Copiar</button>` : ''}${!grabando && s.transcripcion.trim() ? `<button class="btn sm" data-action="vivoTodo" ${ui.estado === 'run' ? 'disabled' : ''}>${ic('refresh')}${v ? 'Rehacer' : 'Armar'} con la transcripción</button>` : ''}</div></div>`;
+  if (!v) return `<div class="card vivo" id="vivo">${head}<div class="vivo-empty">${ic('spark', 'lg')}<span>${grabando ? 'Esperando el primer tramo de la reunión…' : 'Todavía no hay borrador.'}</span></div></div>`;
+  const ca = c => `<li class="${nv(c.entonces)}"><div class="sc"><em>${esc(c.id)}</em>${esc(c.escenario || '')}</div>${c.dado ? `<div><span class="k d">Dado que</span>${esc(c.dado)}</div>` : ''}${c.cuando ? `<div><span class="k c">Cuando</span>${esc(c.cuando)}</div>` : ''}<div><span class="k e">Entonces</span>${esc(c.entonces)}</div></li>`;
+  return `<div class="card vivo" id="vivo">${head}
+    <div class="vivo-grid">
+      <div class="vivo-hu">
+        <div class="eqb" style="--k:var(--tk)">${ic('stack')}HU general de la iniciativa</div>
+        <div class="title${nv(v.titulo)}" style="margin-top:10px">${esc(v.titulo || '[A DEFINIR]')}</div>
+        <div class="userstory sm${nv(v.quiero)}"><b>Como</b> ${esc(v.rol || '[A DEFINIR]')}, <b>quiero</b> ${esc(v.quiero || '[A DEFINIR]')}, <b>para</b> ${esc(v.para || '[A DEFINIR]')}.</div>
+        ${v.decisiones.length ? `<div class="subsec"><h5>Decisiones</h5><ul class="blist" style="--k:var(--qa)">${v.decisiones.map(d => `<li class="${nv(d)}">${esc(d)}</li>`).join('')}</ul></div>` : ''}
+        ${v.reglas.length ? `<div class="subsec"><h5>Reglas de negocio</h5><div class="rn">${v.reglas.map(r => `<div class="${nv(r.texto)}"><em>${esc(r.id)}</em><span>${esc(r.texto)}</span></div>`).join('')}</div></div>` : ''}
+        ${v.criterios.length ? `<div class="subsec"><h5>Criterios de aceptación</h5><ol class="gherkin">${v.criterios.map(ca).join('')}</ol></div>` : ''}
+        ${v.dudas.length ? `<div class="subsec"><h5>Dudas abiertas</h5><ul class="blist" style="--k:var(--warn)">${v.dudas.map(d => `<li class="${nv(d)}">${esc(d)}</li>`).join('')}</ul></div>` : ''}
+      </div>
+      <div class="vivo-subs">${v.subs.map(sb => { const eq = EQUIPOS.find(e => e.k === sb.equipo), p = sb.equipo + '|';
+        return `<div class="subcard ${eq.css} open"><div class="vsh"><span class="eqb">${ic(eq.ic)}${eq.nombre}</span></div>
+          <div class="subbody">
+            <b class="${nv(p + sb.titulo)}" style="display:block;font-size:14px;margin-bottom:6px">${esc(sb.titulo || '[A DEFINIR]')}</b>
+            <div class="small" style="color:var(--soft)"><b style="color:var(--k)">Quiero</b> ${esc(sb.quiero || '[A DEFINIR]')}</div>
+            ${sb.tareas.length ? `<ul class="tasks" style="margin-top:8px">${sb.tareas.map(t => `<li class="${nv(p + t)}"><span>☐</span><span>${esc(t)}</span></li>`).join('')}</ul>` : ''}
+            ${sb.criterios.length ? `<ol class="gherkin mini">${sb.criterios.map(c => `<li class="${nv(p + c.entonces)}"><em>${esc(c.id)}</em> ${c.dado ? `<span class="k d">Dado que</span> ${esc(c.dado)} ` : ''}${c.cuando ? `<span class="k c">cuando</span> ${esc(c.cuando)} ` : ''}<span class="k e">entonces</span> ${esc(c.entonces)}</li>`).join('')}</ol>` : ''}
+            ${sb.dependencias.length ? `<div class="small" style="margin-top:6px;color:var(--warn)">↳ ${sb.dependencias.map(esc).join(' · ')}</div>` : ''}
+            ${sb.abiertos.length ? `<div class="small muted" style="margin-top:4px">${ic('help')} ${sb.abiertos.map(esc).join(' · ')}</div>` : ''}
+          </div></div>`; }).join('')}</div>
+    </div>
+    <div class="row between" style="margin-top:14px"><span class="small muted">Es un borrador. Al terminar, generá las historias finales con el esqueleto completo de 13 secciones.</span><button class="btn sm primary" data-action="irGenerar" ${grabando ? 'disabled' : ''}>${ic('spark')}Generar historias finales</button></div>
+  </div>`;
+}
+
 /* ---------------- estado de la UI ---------------- */
 let S = null, VISTA = 'lista', TAB = 'contexto';
 let GEN = { activo: false, msg: '' };
@@ -1355,7 +1511,7 @@ function tabReunion() {
   const soportaVirtual = !!navigator.mediaDevices?.getDisplayMedia;
   $('#tabbody').innerHTML = `
     <div class="card">
-      <div class="chead"><div><h3><span class="petal"></span>Grabar la reunión</h3><p class="sub">La transcripción se hace por tramos de 5 minutos mientras grabás.</p></div></div>
+      <div class="chead"><div><h3><span class="petal"></span>Grabar la reunión</h3><p class="sub">La transcripción y la historia en vivo se actualizan cada 3 minutos mientras grabás.</p></div></div>
       ${otra ? `<div class="notice err" style="margin-bottom:14px">${ic('bolt')} Hay otra sesión grabando. Detenela antes de grabar acá.</div>` : ''}
       <div class="modes">
         <button class="mode ${s.modoGrabacion === 'virtual' ? 'on' : ''}" data-action="modo" data-v="virtual" ${grabando || !soportaVirtual ? 'disabled' : ''}>
@@ -1375,7 +1531,8 @@ function tabReunion() {
       </div>
       <div class="row" style="margin-top:12px"><span class="small muted">Tu voz aparece en la transcripción como</span><input type="text" id="miNombre" value="${esc(cfg.miNombre)}" placeholder="Producto" style="width:170px;height:34px;border-radius:999px;padding:0 14px"></div>` : ''}
       ${(() => { const v = vocesParaSesion(s); return `<div class="vozinfo">${ic('mic')}${v.length ? `<span><b>Identificación por voz activa:</b> ${v.map(x => esc(x.label)).join(', ')}</span>` : `<span class="muted">Sin voces registradas: los demás aparecen como "Reunión".</span>`}<a href="#" data-action="voces">${v.length ? 'Gestionar' : 'Registrar voces'}</a></div>`; })()}
-      <label class="consent"><input type="checkbox" data-bind-check="consentimiento" ${s.consentimiento ? 'checked' : ''} ${grabando ? 'disabled' : ''}><span>Avisé a los participantes que la reunión se graba para generar la documentación.</span></label>
+      <label class="consent"><input type="checkbox" data-bind-check="vivoActivo" ${s.vivoActivo !== false ? 'checked' : ''}><span><b>Armar la historia en vivo mientras grabo</b>: HU general + HU de ${equiposSesion(s).map(k => EQUIPOS.find(e => e.k === k).nombre).join(', ')}, actualizadas cada 3 minutos.</span></label>
+      <label class="consent" style="margin-top:8px"><input type="checkbox" data-bind-check="consentimiento" ${s.consentimiento ? 'checked' : ''} ${grabando ? 'disabled' : ''}><span>Avisé a los participantes que la reunión se graba para generar la documentación.</span></label>
       <div class="recstage">
         <button class="recbtn ${grabando ? 'stop' : ''}" data-action="${grabando ? 'detener' : 'grabar'}" ${otra ? 'disabled' : ''} aria-label="${grabando ? 'Detener' : 'Grabar'}"><span class="in"><span class="core"></span>${grabando ? 'PARAR' : 'GRABAR'}</span></button>
         <div class="recinfo">
@@ -1392,6 +1549,7 @@ function tabReunion() {
       </div>
       <ul class="notes" id="notas">${pintarNotas()}</ul>
     </div>
+    ${panelVivo(s)}
     <div class="card">
       <div class="chead">
         <div><h3><span class="petal" style="--k:var(--it)"></span>Transcripción</h3><p class="sub">¿Ya tenés la de Teams o Meet? Pegala acá. Podés corregir errores antes de generar.</p></div>
@@ -1513,6 +1671,7 @@ async function procesarSegmento(R, idx, blob, ext) {
     R.estadoSegs[idx] = 'ok'; delete R.fallidos[idx];
   } catch (e) { R.estadoSegs[idx] = 'error'; R.fallidos[idx] = { blob, ext }; toast(`Tramo ${idx + 1}: ${e.message}`, 'error', 6000); }
   armarTranscripcion(R); refrescarRecUI();
+  if (R.sesion.vivoActivo !== false && R.segs[idx]) encolarVivo(R.sesion, R.segs[idx], `tramo ${idx + 1}`);
 }
 // ¿Qué proporción del tramo [a,b] (en segundos) hablaste vos?
 function fraccionYo(F, a, b) {
@@ -1662,7 +1821,7 @@ function tabHistorias() {
   const generando = GEN.activo && GEN.sid === s.id;
   const banner = generando ? `<div class="card ins" style="margin-bottom:16px"><div class="genstatus" style="margin:0"><div class="spin"></div><span id="genmsg">${esc(GEN.msg)}</span></div><p class="small muted" style="margin:8px 0 0">Con el plan gratuito de Groq cada historia puede tardar hasta un minuto. Podés seguir trabajando en otra pestaña.</p></div>` : '';
   if (!r) {
-    $('#tabbody').innerHTML = `${banner}<div class="card">
+    $('#tabbody').innerHTML = `${banner}${s.vivo ? panelVivo(s) : ''}<div class="card">
       <div class="chead"><div><h3><span class="petal"></span>Generar historias con el esqueleto de Tokin</h3><p class="sub">13 secciones por historia: contexto, alcance, RN, CA en Gherkin, UX, IT Front, IT Back, QA, medición, dependencias, preguntas y DoR/DoD.</p></div></div>
       <div class="checks">
         ${chk(s.transcripcion.trim(), `Transcripción${s.transcripcion.trim() ? ` · ${palabras(s.transcripcion)} palabras` : ' (o pegá / importá la de Webex en el paso 2)'}`)}
@@ -1847,7 +2006,7 @@ async function generar() {
   try {
     if ((s.imagenes || []).length && !s.analisisDiseno.trim()) { s.analisisDiseno = await leerDiseno(setGen); guardarLuego(s); }
     const modelo = await modeloTexto(), T = tpmDe(modelo), maxOut = Math.min(6000, Math.floor(T * 0.45));
-    const material = await prepararMaterial(s, modelo, T, sysHU(s), 400);
+    const material = (await prepararMaterial(s, modelo, T, sysHU(s), 400 + estimTokens(vivoRef(s)))) + vivoRef(s);
     setGen('Armando la minuta y el plan de historias…');
     const min = await chat([{ role: 'system', content: sysMinuta(s) }, { role: 'user', content: `${contextoTexto(s)}\n\n${material}` }], { onWait: setGen, max: Math.min(2500, maxOut), model: modelo });
     const plan = arr(min.historias).map(p => ({ titulo: toStr(p.titulo || ''), epica: toStr(p.epica || ''), foco: toStr(p.foco || '') })).filter(p => p.titulo);
@@ -2112,6 +2271,8 @@ const acciones = {
   ajustar: () => ajustar(),
   copiarHU: el => { const h = S.resultado.historias[+el.dataset.i]; copiar(huMarkdown(h), `${h.id} completa copiada (13 secciones)`); },
   subEq: el => { const v = el.dataset.v, L = S.subEquipos || EQUIPOS.map(e => e.k); S.subEquipos = L.includes(v) ? L.filter(x => x !== v) : EQUIPOS.map(e => e.k).filter(k => L.includes(k) || k === v); guardarLuego(); el.classList.toggle('on'); },
+  copiarVivo: () => copiar(vivoMarkdown(S), 'Borrador en vivo copiado'),
+  vivoTodo: () => vivoDesdeTranscripcion(S),
   copiarSub: el => { const h = S.resultado.historias[+el.dataset.i], sb = h.subs[+el.dataset.j]; copiar(subMarkdown(h, sb), `${idSub(h, sb)} copiada`); },
   copiarSubs: el => { const h = S.resultado.historias[+el.dataset.i]; copiar(h.subs.map(sb => subMarkdown(h, sb)).join('\n\n---\n\n'), `Sub-historias de ${h.id} copiadas`); },
   genSubs: async el => {
