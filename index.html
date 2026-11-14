@@ -329,6 +329,9 @@ details[open].areas summary svg{transform:rotate(90deg)}
 .nuevo{animation:nuevo 3.5s ease-out 1;border-radius:8px}
 @keyframes nuevo{0%{background:rgba(var(--tk-rgb),.35);box-shadow:0 0 0 2px rgba(var(--tk-rgb),.6)}100%{background:transparent;box-shadow:none}}
 @media(max-width:900px){.vivo-grid{grid-template-columns:1fr}}
+.cont{border-color:color-mix(in srgb,var(--warn) 45%,transparent);margin-bottom:16px}
+.cont h3{font-size:14px}
+.partes{display:inline-flex;gap:12px;margin-left:6px}.partes a{display:inline-flex;gap:4px;align-items:center;font-weight:700;text-decoration:none}
 .ux{--k:var(--ux)}.it{--k:var(--it)}.qa{--k:var(--qa)}
 .quote{font-size:13px;color:var(--muted);font-style:italic;border-left:2px solid var(--tk);padding:2px 0 2px 12px;margin-top:10px}
 [contenteditable]{outline:none;border-radius:6px;transition:background .15s}
@@ -562,7 +565,7 @@ const Store = {
   },
   async guardar(s) {
     s.actualizado = Date.now(); CACHE[s.id] = s;
-    const data = clone({ ...s, imagenes: undefined, _imgsCargadas: undefined, _vivoCola: undefined });
+    const data = clone({ ...s, imagenes: undefined, _imgsCargadas: undefined, _vivoCola: undefined, _previa: undefined });
     if (this.modo === 'firebase') await this.db.ref(DB_ROOT + '/sesiones/' + s.id).set(data);
     else { const all = this._localAll(); all[s.id] = data; this._localSet(all); }
   },
@@ -597,7 +600,8 @@ function cargarScript(src) { return new Promise((res, rej) => { if (document.que
 function normSesion(s) {
   s = s || {};
   return {
-    id: s.id || uid(), titulo: s.titulo || 'Nueva sesión', tipo: TIPOS.includes(s.tipo) ? s.tipo : TIPOS[0],
+    id: s.id || uid(), titulo: s.titulo || 'Nueva sesión', tipo: TIPOS[0],
+    previaId: s.previaId || '', serieId: s.serieId || '', parte: +s.parte || 1,
     creado: s.creado || Date.now(), actualizado: s.actualizado || Date.now(),
     contexto: { necesidad: '', criterio: '', boceto: '', epica: '', objetivo: '', ...(s.contexto || {}), participantes: arr(s.contexto?.participantes), figma: arr(s.contexto?.figma), personas: arr(s.contexto?.personas) },
     analisisDiseno: s.analisisDiseno || '', transcripcion: s.transcripcion || '', notas: arr(s.notas),
@@ -669,7 +673,7 @@ function normRes(r) {
   return {
     resumen: toStr(r.resumen || ''),
     decisiones: L(r.decisiones), acuerdos: L(r.acuerdos), ideas: L(r.ideas_mencionadas || r.ideas), contradicciones: L(r.contradicciones),
-    plan: arr(r.plan || r.historias_plan).map(p => ({ titulo: toStr(p.titulo || ''), epica: toStr(p.epica || ''), foco: toStr(p.foco || '') })),
+    plan: arr(r.plan || r.historias_plan).map(p => ({ titulo: toStr(p.titulo || ''), epica: toStr(p.epica || ''), foco: toStr(p.foco || ''), base: toStr(p.base || ''), cambios: p.cambios !== false })),
     historias: arr(r.historias).map((h, i) => normHU(h, i)),
     pendientes: { ux: L(P.ux || r.ux), front: L(P.front), back: L(P.back || r.it), qa: L(P.qa || r.qa) },
     dudas_abiertas: arr(r.dudas_abiertas).map(d => typeof d === 'string' ? { pregunta: d, responsable: '' } : { pregunta: toStr(d.pregunta || ''), responsable: toStr(d.responsable || '') }).filter(d => d.pregunta),
@@ -802,11 +806,12 @@ TAREA: armá la minuta de la reunión y el plan de historias.
 - Si una historia superaría ~8 criterios de aceptación o toca más de 2 pantallas grandes, partila.
 - Si la reunión no trató requerimientos de producto, "historias" puede ser [].
 - Acuerdos: con roles, no nombres.
+${s.previaId ? `- CONTINUACIÓN: esta reunión sigue una sesión anterior. Sus historias siguen vigentes. Incluí en "historias" TODAS las de la sesión anterior (con "base" = su id anterior, ej. "HU-01") y "cambios" = true solo si hoy se habló algo que la modifica; si no se tocó, "cambios" = false. Agregá historias nuevas (base vacío) solo si surgió algo nuevo. Si hoy se respondió una duda anterior, pasala a decisiones.` : ''}
 
 ESQUEMA:
 {"resumen":"3 a 5 líneas","decisiones":["decisión tomada"],"ideas_mencionadas":["idea que no se decidió"],"contradicciones":["punto donde hubo posturas distintas"],
 "acuerdos":["acuerdo de la reunión (roles)"],
-"historias":[{"titulo":"verbo en infinitivo + objeto + contexto","epica":"nombre de la épica","foco":"qué cubre exactamente esta historia y qué no, en 1-2 líneas"}],
+"historias":[{"titulo":"verbo en infinitivo + objeto + contexto","epica":"nombre de la épica","foco":"qué cubre exactamente esta historia y qué no, en 1-2 líneas","base":"id de la historia anterior que continúa, o vacío","cambios":true}],
 "pendientes":{"ux":["pendiente de UX"],"front":["pendiente de IT Front"],"back":["pendiente de IT Back"],"qa":["pendiente de QA"]},
 "dudas_abiertas":[{"pregunta":"","responsable":"Producto | UX | IT | QA"}],
 "acciones":[{"tarea":"","responsable":"rol","fecha":"si se mencionó"}],
@@ -850,8 +855,9 @@ function contextoTexto(s, incluirLecturaDiseno = true) {
   if (c.participantes.length) b.push(`ÁREAS PARTICIPANTES: ${c.participantes.join(', ')}`);
   if (c.personas.length) b.push(`PERSONAS EN LA REUNIÓN: ${c.personas.map(p => `${p.nombre} (${p.area})`).join(', ')}`);
   b.push(`QUIÉN GRABÓ: ${miEtiqueta()} (Producto)`);
-  b.push(`NECESIDAD (Producto):\n${c.necesidad || '[no cargada]'}`);
-  b.push(`CRITERIO DE NEGOCIO (Producto):\n${c.criterio || '[no cargado]'}`);
+  if (c.necesidad) b.push(`NECESIDAD (Producto):\n${c.necesidad}`);
+  if (c.criterio) b.push(`CRITERIO DE NEGOCIO (Producto):\n${c.criterio}`);
+  if (s.previaId && s._previa) b.push(resumenPrevia(s));
   if (c.boceto) b.push(`BOCETO / LO QUE PRODUCTO QUIERE IMPULSAR:\n${c.boceto}`);
   if (c.figma.length) b.push(`LINKS DE DISEÑO (Figma):\n${c.figma.join('\n')}`);
   if (incluirLecturaDiseno && s.analisisDiseno) b.push(`LECTURA DEL DISEÑO:\n${s.analisisDiseno}`);
@@ -1170,6 +1176,7 @@ TAREA: mantenés un BORRADOR EN VIVO de la historia de usuario de la iniciativa 
 - Sub-historias: SIEMPRE una por cada equipo pedido, en este orden: ${eqs.join(', ')}. Aunque todavía no se haya hablado de un equipo (por ejemplo Admin), incluila con título y "quiero" derivados de la historia general y lo que falte como [A DEFINIR] en "abiertos".
   · Front: tienda Tokin mobile/desktop. · Back: servicios, datos, integraciones. · Admin: carga y configuración en el Admin de Tokin. · UX: diseño final en Figma.
 - Sé breve: es un borrador que se lee en vivo.
+${s.previaId ? '- Es la continuación de una reunión anterior: el borrador actual ya trae lo de esa reunión. Sumá lo de hoy y sacá de "dudas" lo que hoy se respondió.' : ''}
 
 ESQUEMA:
 {"titulo":"verbo en infinitivo + objeto + contexto","rol":"","quiero":"","para":"","contexto":"1-2 líneas","decisiones":[""],
@@ -1305,11 +1312,9 @@ async function renderLista() {
     <div class="kpis rv" id="kpis">${[0, 1, 2, 3].map(() => `<div class="card kpi"><div class="lbl">…</div><div class="val">–</div></div>`).join('')}</div>
     <div class="toolbar">
       <div class="searchbox">${ic('search')}<input type="search" id="q" placeholder="Buscar sesión o iniciativa…" value="${esc(FILTRO.q)}"></div>
-      <div class="seg" id="ftipo"><button data-t="" class="${!FILTRO.tipo ? 'on' : ''}">Todas</button>${TIPOS.map(t => `<button data-t="${esc(t)}" class="${FILTRO.tipo === t ? 'on' : ''}">${esc(t.split(' /')[0])}</button>`).join('')}</div>
     </div>
     <div id="lista" class="list"><div class="card empty" style="grid-column:1/-1"><div class="spin" style="margin:0 auto"></div></div></div>`;
   $('#q').oninput = e => { FILTRO.q = e.target.value; pintarLista(); };
-  $('#ftipo').onclick = e => { const b = e.target.closest('button'); if (!b) return; FILTRO.tipo = b.dataset.t; [...$('#ftipo').children].forEach(x => x.classList.toggle('on', x === b)); pintarLista(); };
   try { LISTA = await Store.listar(); } catch (e) { LISTA = []; toast('No pude leer las sesiones: ' + e.message, 'error'); }
   if (VISTA === 'lista') { pintarKpis(); pintarLista(); }
 }
@@ -1334,7 +1339,7 @@ function pintarLista() {
   el.innerHTML = items.map((s, i) => {
     const [est, cls] = estadoDe(s);
     return `<div class="card scard rv" style="animation-delay:${Math.min(i, 8) * 40}ms" data-action="open" data-id="${s.id}">
-      <div class="row between"><span class="chip gray">${esc(s.tipo)}</span><span class="chip ${cls}">${est}</span></div>
+      <div class="row between"><span class="row" style="gap:6px"><span class="chip gray">Discovery</span>${s.parte > 1 ? `<span class="chip y">Parte ${s.parte}</span>` : ''}</span><span class="chip ${cls}">${est}</span></div>
       <h3>${esc(s.titulo)}</h3>
       <div class="meta">${ic('clock')}${fmtFecha(s.creado)}${s.duracionGrabada ? ' · ' + fmtT(s.duracionGrabada) + ' grabados' : ''}</div>
       ${s.resultado?.resumen ? `<p>${esc(s.resultado.resumen.slice(0, 150))}${s.resultado.resumen.length > 150 ? '…' : ''}</p>` : ''}
@@ -1347,6 +1352,7 @@ async function abrirSesion(id, tab) {
   const s = await Store.obtener(id);
   if (!s) return toast('No encontré la sesión.', 'error');
   if (!s._imgsCargadas) { s.imagenes = await Store.imagenes(id).catch(() => []); s._imgsCargadas = true; }
+  if (s.previaId && !s._previa) s._previa = await Store.obtener(s.previaId).catch(() => null);
   S = s; VISTA = 'sesion'; TAB = tab || (s.resultado ? 'historias' : s.transcripcion ? 'reunion' : 'contexto');
   window.scrollTo(0, 0); render();
 }
@@ -1360,6 +1366,62 @@ async function nuevaSesion() {
   setTimeout(() => { const t = $('#titulo'); t?.focus(); t?.select(); }, 60);
 }
 
+/* ---------------- CONTINUACIÓN DE SESIONES ---------------- */
+const dudasDe = P => {
+  const todas = [...(P?.resultado?.dudas_abiertas || []).map(d => d.pregunta), ...(P?.resultado?.historias || []).flatMap(h => h.preguntas.filter(q => !/resuelt|cerrad/i.test(q.estado)).map(q => `${h.id}: ${q.pregunta}`)), ...(!P?.resultado && P?.vivo ? P.vivo.dudas : [])];
+  const vistas = new Set();
+  return todas.filter(d => { const k = d.replace(/^HU-\d+:\s*/, '').toLowerCase().replace(/[^a-z0-9áéíóúñ ]/g, '').trim(); if (vistas.has(k)) return false; vistas.add(k); return true; });
+};
+function resumenPrevia(s) {
+  const P = s._previa; if (!P) return '';
+  const r = P.resultado, d = dudasDe(P).slice(0, 12);
+  return `CONTINUACIÓN: esta reunión es la Parte ${s.parte} y sigue la sesión anterior "${P.titulo}" (${fmtFecha(P.creado)}).
+${r?.resumen ? 'Resumen anterior: ' + r.resumen + '\n' : ''}${r?.decisiones?.length ? 'Decisiones anteriores: ' + r.decisiones.join(' | ') + '\n' : ''}${d.length ? 'Dudas que quedaron abiertas: ' + d.join(' | ') : ''}`.trim();
+}
+function huCompacta(h) {
+  return { id: h.id, titulo: h.titulo, epica: h.epica, prioridad: h.prioridad, contexto: h.contexto, rol: h.rol, quiero: h.quiero, para: h.para, incluye: h.incluye, fuera_de_alcance: h.fuera_de_alcance, reglas: h.reglas.map(r => `${r.id}: ${r.texto}`), criterios: h.criterios.map(c => `${c.id} ${c.escenario}: dado ${c.dado}, cuando ${c.cuando}, entonces ${c.entonces}`), preguntas: h.preguntas.map(q => q.pregunta) };
+}
+function historiasPrevias(s) {
+  const hs = s._previa?.resultado?.historias || [];
+  return hs.length ? `\n\nHISTORIAS DE LA SESIÓN ANTERIOR (Parte ${s._previa.parte || 1}):\n${JSON.stringify(hs.map(h => ({ id: h.id, titulo: h.titulo, quiero: h.quiero, reglas: h.reglas.map(r => r.id + ': ' + r.texto), preguntas: h.preguntas.map(q => q.pregunta) })))}` : '';
+}
+function semillaVivo(P) {
+  if (P.vivo) return normVivo({ ...clone(P.vivo), tramos: 0, actualizado: Date.now() });
+  const h = P.resultado?.historias?.[0]; if (!h) return null;
+  return normVivo({ titulo: h.titulo, rol: h.rol, quiero: h.quiero, para: h.para, contexto: h.contexto, decisiones: P.resultado.decisiones, reglas: h.reglas, criterios: h.criterios, dudas: dudasDe(P), subs: (h.subs || []).map(x => ({ equipo: x.equipo, titulo: x.titulo, quiero: x.quiero, tareas: x.tareas, criterios: x.criterios, dependencias: x.dependencias, abiertos: x.abiertos })), tramos: 0, actualizado: Date.now() });
+}
+async function continuarSesion(prev) {
+  if (REC.activo) return toast('Detené la grabación antes de crear la continuación.', 'error');
+  const s = normSesion({});
+  s.previaId = prev.id; s.serieId = prev.serieId || prev.id; s.parte = (prev.parte || 1) + 1;
+  s.titulo = `${prev.titulo.replace(/\s*·\s*Parte \d+$/i, '')} · Parte ${s.parte}`;
+  s.contexto = clone(prev.contexto); s.subEquipos = [...(prev.subEquipos || [])]; s.subActivas = prev.subActivas; s.vivoActivo = prev.vivoActivo; s.modoGrabacion = prev.modoGrabacion;
+  s.analisisDiseno = prev.analisisDiseno || ''; s.vivo = semillaVivo(prev);
+  s.imagenes = clone(prev._imgsCargadas ? prev.imagenes || [] : await Store.imagenes(prev.id).catch(() => [])); s.cantImagenes = s.imagenes.length; s._imgsCargadas = true;
+  s._previa = prev;
+  try { await Store.guardar(s); if (s.imagenes.length) await Store.guardarImagenes(s.id, s.imagenes); } catch (e) { toast('No se pudo guardar: ' + e.message, 'error'); }
+  S = s; VISTA = 'sesion'; TAB = 'contexto'; window.scrollTo(0, 0); render();
+  toast(`Parte ${s.parte} creada: arranca desde donde quedó la anterior`, 'ok', 5000);
+}
+function navPartes(s) {
+  const prev = s.previaId ? `<a href="#" class="small" data-action="open" data-id="${s.previaId}">${ic('back')} Parte ${s.parte - 1}</a>` : '';
+  const sig = Object.values(CACHE).find(x => x.previaId === s.id);
+  const next = sig ? `<a href="#" class="small" data-action="open" data-id="${sig.id}">Parte ${sig.parte} ${ic('next')}</a>` : '';
+  return prev || next ? `<span class="partes">${prev}${next}</span>` : '';
+}
+function tarjetaContinuacion(s) {
+  const P = s._previa;
+  if (!P) return `<div class="card cont"><div class="small muted">${ic('stack')} Continuación de una sesión anterior que ya no está disponible.</div></div>`;
+  const d = dudasDe(P).slice(0, 8), hs = P.resultado?.historias || [];
+  return `<div class="card cont">
+    <div class="chead"><div><h3>${ic('stack')}Continúa la Parte ${P.parte || 1} · ${esc(P.titulo)}</h3><p class="sub">${fmtFecha(P.creado)}. Lo que se hable hoy se suma a lo de esa reunión: las historias se actualizan, no se duplican.</p></div><a href="#" class="btn sm" data-action="open" data-id="${P.id}">${ic('back')}Ver Parte ${P.parte || 1}</a></div>
+    <div class="grid2">
+      <div><h4 class="subs-t" style="color:var(--muted)">Historias que vienen de antes</h4>${hs.length ? `<ul class="blist" style="margin-top:8px">${hs.map(h => `<li>${esc(h.id)} · ${esc(h.titulo)}</li>`).join('')}</ul>` : `<div class="small muted" style="margin-top:8px">${P.vivo ? 'Solo el borrador en vivo (se usa como punto de partida).' : 'Todavía no se generaron historias.'}</div>`}</div>
+      <div><h4 class="subs-t" style="color:var(--warn)">Dudas para retomar hoy</h4>${d.length ? `<ul class="blist" style="--k:var(--warn);margin-top:8px">${d.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : '<div class="small muted" style="margin-top:8px">No quedaron dudas abiertas.</div>'}</div>
+    </div>
+  </div>`;
+}
+
 /* ---------------- SESIÓN ---------------- */
 function renderSesion() {
   const s = S, [est, cls] = estadoDe(s);
@@ -1371,11 +1433,11 @@ function renderSesion() {
         <button class="btn sm ghost" data-action="go-list" style="margin-left:-12px">${ic('back')}Sesiones</button>
         <input class="title" id="titulo" data-bind="titulo" value="${esc(s.titulo)}" aria-label="Título de la sesión">
         <div class="row small muted">
-          <select data-bind="tipo">${TIPOS.map(t => `<option ${s.tipo === t ? 'selected' : ''}>${t}</option>`).join('')}</select>
+          <span class="chip">Discovery</span>${s.parte > 1 ? `<span class="chip y">Parte ${s.parte}</span>` : ''}${navPartes(s)}
           <span>${fmtFecha(s.creado)}</span><span class="chip ${cls}">${est}</span>
         </div>
       </div>
-      <button class="btn sm danger" data-action="borrar">${ic('trash')}Eliminar</button>
+      <div class="row" style="gap:6px"><button class="btn sm" data-action="continuar" title="Crear la próxima reunión del mismo tema, que sigue donde quedó esta">${ic('next')}Continuar en otra sesión</button><button class="btn sm danger" data-action="borrar">${ic('trash')}Eliminar</button></div>
     </div>
     <nav class="steps">
       <button class="step ${TAB === 'contexto' ? 'on' : ''}" data-tab="contexto"><span class="n">1</span>Contexto y diseño</button>
@@ -1390,19 +1452,12 @@ function renderSesion() {
 function tabContexto() {
   const s = S, c = s.contexto, imgs = s.imagenes || [];
   $('#tabbody').innerHTML = `
+    ${s.previaId ? tarjetaContinuacion(s) : ''}
     <div class="card">
-      <div class="chead"><div><h3><span class="petal"></span>Lo que lleva Producto a la reunión</h3><p class="sub">Le da al agente el norte de la iniciativa. Opcional, pero mejora mucho las historias.</p></div></div>
-      <label class="f" style="margin-top:0">Necesidad <span>· obligatoria · qué problema resolvemos y para quién</span></label>
-      <textarea data-bind="contexto.necesidad" rows="3" placeholder="Ej.: los PDV no saben cuánto ahorran con las promos…">${esc(c.necesidad)}</textarea>
-      <div class="grid2">
-        <div><label class="f">Criterio de negocio <span>· obligatorio · reglas, montos, vigencias</span></label><textarea data-bind="contexto.criterio" rows="4" placeholder="Qué métrica mueve, objetivo, alcance…">${esc(c.criterio)}</textarea></div>
-        <div><label class="f">Boceto / lo que queremos impulsar</label><textarea data-bind="contexto.boceto" rows="4" placeholder="Comportamiento esperado, reglas que ya están claras…">${esc(c.boceto)}</textarea></div>
-      </div>
-      <div class="grid2">
-        <div><label class="f">Épica <span>· opcional</span></label><input type="text" data-bind="contexto.epica" value="${esc(c.epica || '')}" placeholder="Ej.: Fidelización"></div>
-        <div><label class="f">Objetivo / KPI <span>· opcional</span></label><input type="text" data-bind="contexto.objetivo" value="${esc(c.objetivo || '')}" placeholder="Ej.: Evolutivo Tienda · conversión"></div>
-      </div>
-      <label class="f">Participantes</label>
+      <div class="chead"><div><h3><span class="petal"></span>Contexto de la reunión</h3><p class="sub">Todo es opcional: si no completás nada, el agente arma las historias con lo que se hable en la reunión.</p></div></div>
+      <label class="f" style="margin-top:0">Criterio de negocio <span>· opcional · reglas, montos, vigencias que ya tengas claras</span></label>
+      <textarea data-bind="contexto.criterio" rows="3" placeholder="Ej.: el ahorro se calcula por mes calendario y solo con pedidos facturados…">${esc(c.criterio)}</textarea>
+      <label class="f">Áreas participantes</label>
       <div class="row">${[...new Set([...AREAS, ...c.participantes])].map(a => `<button class="toggle ${c.participantes.includes(a) ? 'on' : ''}" data-action="part" data-v="${esc(a)}">${esc(a)}</button>`).join('')}
         <input type="text" id="otroPart" placeholder="+ otro equipo y Enter" style="width:180px;border-radius:999px;padding:7px 14px">
       </div>
@@ -1425,12 +1480,7 @@ function tabContexto() {
         <button class="ib sm" data-action="delFigma" data-i="${i}" title="Quitar">${ic('x')}</button></li>`).join('')}</ul>` : ''}
       <div class="drop" id="drop"><div class="ic">${ic('image', 'lg')}</div><div><b style="color:var(--ink)">Arrastrá capturas acá</b>, pegalas con Ctrl+V o tocá para elegir</div><input type="file" id="fileImg" accept="image/*" multiple hidden></div>
       ${imgs.length ? `<div class="thumbs">${imgs.map((u, i) => `<div class="thumb"><img src="${u}" data-action="verImg" data-i="${i}" alt="Pantalla ${i + 1}"><button data-action="delImg" data-i="${i}" title="Quitar">${ic('x')}</button></div>`).join('')}</div>
-        <div class="row between" style="margin-top:20px">
-          <div><b>Lectura del diseño por IA</b><div class="small muted">Describe pantallas, componentes y reglas visibles. Podés corregirla.</div></div>
-          <button class="btn sm" data-action="leerDiseno" ${GEN.activo ? 'disabled' : ''}>${ic(s.analisisDiseno ? 'refresh' : 'eye')}${s.analisisDiseno ? 'Volver a leer' : 'Leer diseño con IA'}</button>
-        </div>
-        <textarea data-bind="analisisDiseno" rows="6" style="margin-top:10px" placeholder="Todavía sin leer. Se lee automáticamente al generar historias.">${esc(s.analisisDiseno)}</textarea>
-        <div id="genDiseno"></div>` : ''}
+` : ''}
     </div>
     <div class="navfoot"><span></span><button class="btn primary" data-tab="reunion">Siguiente: grabar la reunión${ic('next')}</button></div>`;
   const drop = $('#drop'), fi = $('#fileImg');
@@ -1825,12 +1875,10 @@ function tabHistorias() {
       <div class="chead"><div><h3><span class="petal"></span>Generar historias con el esqueleto de Tokin</h3><p class="sub">13 secciones por historia: contexto, alcance, RN, CA en Gherkin, UX, IT Front, IT Back, QA, medición, dependencias, preguntas y DoR/DoD.</p></div></div>
       <div class="checks">
         ${chk(s.transcripcion.trim(), `Transcripción${s.transcripcion.trim() ? ` · ${palabras(s.transcripcion)} palabras` : ' (o pegá / importá la de Webex en el paso 2)'}`)}
-        ${chk(s.contexto.necesidad, 'Necesidad / problema de negocio', 'Obligatorio')}
-        ${chk(s.contexto.criterio, 'Criterio de negocio (reglas, montos, vigencias)', 'Obligatorio')}
+        ${chk(s.contexto.criterio, 'Criterio de negocio (opcional)')}
         ${chk((s.imagenes || []).length || s.contexto.figma.length, 'Diseño (opcional: capturas o links de Figma)')}
-        ${chk(s.contexto.objetivo, 'Objetivo / KPI (opcional)')}
+        ${s.previaId ? chk(s._previa?.resultado?.historias?.length || s._previa?.vivo, s._previa?.resultado?.historias?.length ? `Historias de la Parte ${s._previa.parte || 1}: ${s._previa.resultado.historias.length} (se actualizan con lo de hoy)` : 'Sesión anterior (se continúa desde su borrador)') : ''}
       </div>
-      ${(!s.contexto.necesidad || !s.contexto.criterio) ? `<div class="notice" style="margin-bottom:16px">${ic('help')} El esqueleto pide necesidad y criterio de negocio. Si faltan, el agente igual arma las historias, pero marca [A DEFINIR] y las deja en Borrador. <button class="btn sm" data-tab="contexto">Completar contexto</button></div>` : ''}
       <div class="subcfg">
         <label class="row" style="gap:10px;cursor:pointer"><input type="checkbox" data-bind-check="subActivas" ${s.subActivas !== false ? 'checked' : ''} style="accent-color:var(--tk);width:16px;height:16px"><b>Abrir cada historia en sub-historias por equipo</b></label>
         <div class="row" style="margin-top:8px">${EQUIPOS.map(e => `<button class="toggle ${(s.subEquipos || EQUIPOS.map(x => x.k)).includes(e.k) ? 'on' : ''}" data-action="subEq" data-v="${e.k}">${e.nombre}</button>`).join('')}</div>
@@ -2006,15 +2054,22 @@ async function generar() {
   try {
     if ((s.imagenes || []).length && !s.analisisDiseno.trim()) { s.analisisDiseno = await leerDiseno(setGen); guardarLuego(s); }
     const modelo = await modeloTexto(), T = tpmDe(modelo), maxOut = Math.min(6000, Math.floor(T * 0.45));
-    const material = (await prepararMaterial(s, modelo, T, sysHU(s), 400 + estimTokens(vivoRef(s)))) + vivoRef(s);
+    const material = (await prepararMaterial(s, modelo, T, sysHU(s), 400 + estimTokens(vivoRef(s)) + (s._previa?.resultado?.historias?.length ? 1800 : 0))) + vivoRef(s);
     setGen('Armando la minuta y el plan de historias…');
-    const min = await chat([{ role: 'system', content: sysMinuta(s) }, { role: 'user', content: `${contextoTexto(s)}\n\n${material}` }], { onWait: setGen, max: Math.min(2500, maxOut), model: modelo });
-    const plan = arr(min.historias).map(p => ({ titulo: toStr(p.titulo || ''), epica: toStr(p.epica || ''), foco: toStr(p.foco || '') })).filter(p => p.titulo);
+    const min = await chat([{ role: 'system', content: sysMinuta(s) }, { role: 'user', content: `${contextoTexto(s)}${historiasPrevias(s)}\n\n${material}` }], { onWait: setGen, max: Math.min(2500, maxOut), model: modelo });
+    const plan = arr(min.historias).map(p => ({ titulo: toStr(p.titulo || ''), epica: toStr(p.epica || ''), foco: toStr(p.foco || ''), base: toStr(p.base || '').toUpperCase().match(/HU-\d+/)?.[0] || '', cambios: p.cambios !== false })).filter(p => p.titulo);
     s.resultado = normRes({ ...min, historias: [], plan });
     await Store.guardar(s); if (S === s) renderSesion();
     for (let i = 0; i < plan.length; i++) {
       setGen(`Redactando ${'HU-' + pad2(i + 1)} de ${plan.length}: ${plan[i].titulo}…`);
-      const hu = await redactarHU(s, modelo, maxOut, material, plan[i], i);
+      const previa = plan[i].base && (s._previa?.resultado?.historias || []).find(h => h.id === plan[i].base);
+      let hu;
+      if (previa && !plan[i].cambios) {
+        hu = normHU(clone(previa), i); hu.subs = clone(previa.subs || []);
+        s.resultado.historias.push(hu); await Store.guardar(s); if (S === s && VISTA === 'sesion' && TAB === 'historias') renderSesion();
+        continue;
+      }
+      hu = await redactarHU(s, modelo, maxOut, material, plan[i], i, previa ? `\n\nVERSIÓN ANTERIOR DE ESTA HISTORIA (${previa.id}, Parte ${s._previa.parte || 1}): actualizala con lo nuevo de esta reunión, conservá lo que no cambió, mantené la numeración de RN y CA existentes y sacá de preguntas lo que hoy se respondió:\n${JSON.stringify(huCompacta(previa))}` : '');
       s.resultado.historias.push(hu);
       if (s.subActivas !== false) {
         await Store.guardar(s); if (S === s && VISTA === 'sesion' && TAB === 'historias') renderSesion();
@@ -2223,7 +2278,7 @@ const acciones = {
   cerrarModal: () => $('#modal').innerHTML = '',
   guardarConfig: () => guardarConfigUI(),
   probarGroq: () => probarGroq(),
-  open: el => abrirSesion(el.dataset.id),
+  open: el => { if (REC.activo && VISTA === 'sesion') toast('La grabación sigue activa en segundo plano.'); abrirSesion(el.dataset.id); },
   borrar: async () => {
     if (REC.activo && REC.sid === S.id) return toast('Detené la grabación antes de eliminar.', 'error');
     if (!confirm(`¿Eliminar "${S.titulo}"? No se puede deshacer.`)) return;
@@ -2271,6 +2326,7 @@ const acciones = {
   ajustar: () => ajustar(),
   copiarHU: el => { const h = S.resultado.historias[+el.dataset.i]; copiar(huMarkdown(h), `${h.id} completa copiada (13 secciones)`); },
   subEq: el => { const v = el.dataset.v, L = S.subEquipos || EQUIPOS.map(e => e.k); S.subEquipos = L.includes(v) ? L.filter(x => x !== v) : EQUIPOS.map(e => e.k).filter(k => L.includes(k) || k === v); guardarLuego(); el.classList.toggle('on'); },
+  continuar: () => continuarSesion(S),
   copiarVivo: () => copiar(vivoMarkdown(S), 'Borrador en vivo copiado'),
   vivoTodo: () => vivoDesdeTranscripcion(S),
   copiarSub: el => { const h = S.resultado.historias[+el.dataset.i], sb = h.subs[+el.dataset.j]; copiar(subMarkdown(h, sb), `${idSub(h, sb)} copiada`); },
