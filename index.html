@@ -465,7 +465,7 @@ const CONFIG_FIJO = {
 
 const DEFAULTS = {
   groqKey: '', firebase: null, figmaToken: '', miNombre: '',
-  modeloTexto: 'llama-3.3-70b-versatile',
+  modeloTexto: '',
   modeloAudio: 'whisper-large-v3',
   glosario: 'Tokin, Arcor, PDV, punto de venta, distribuidor, Partners, GTM, UX, QA, IT, historia de usuario, criterio de aceptación, criterio de negocio, Figma, Jira, sprint, Vtex, combo, checkout, carrito, home, banner, cupón, promoción, 2x1, 3x2, billetera, Pedido fácil, Admin.'
 };
@@ -565,7 +565,7 @@ const Store = {
   },
   async guardar(s) {
     s.actualizado = Date.now(); CACHE[s.id] = s;
-    const data = clone({ ...s, imagenes: undefined, _imgsCargadas: undefined, _vivoCola: undefined, _previa: undefined });
+    const data = clone({ ...s, imagenes: undefined, _imgsCargadas: undefined, _vivoCola: undefined, _previa: undefined, _buf: undefined, _material: undefined });
     if (this.modo === 'firebase') await this.db.ref(DB_ROOT + '/sesiones/' + s.id).set(data);
     else { const all = this._localAll(); all[s.id] = data; this._localSet(all); }
   },
@@ -607,7 +607,7 @@ function normSesion(s) {
     analisisDiseno: s.analisisDiseno || '', transcripcion: s.transcripcion || '', notas: arr(s.notas),
     modoGrabacion: s.modoGrabacion || (navigator.mediaDevices?.getDisplayMedia ? 'virtual' : 'presencial'),
     consentimiento: !!s.consentimiento, duracionGrabada: s.duracionGrabada || 0, cantImagenes: s.cantImagenes || 0,
-    vivo: normVivo(s.vivo), vivoActivo: s.vivoActivo !== false,
+    vivo: normVivo(s.vivo), vivoActivo: s.vivoActivo !== false, notasBloques: arr(s.notasBloques).filter(n => n && n.texto), notasChars: +s.notasChars || 0,
     subActivas: s.subActivas !== false, subEquipos: arr(s.subEquipos).length ? arr(s.subEquipos) : EQUIPOS.map(e => e.k),
     resultado: s.resultado ? normRes(s.resultado) : null
   };
@@ -693,15 +693,22 @@ let saveT = null;
 function guardarLuego(s = S) { clearTimeout(saveT); saveT = setTimeout(() => Store.guardar(s).catch(e => toast('No se pudo guardar: ' + e.message, 'error')), 700); }
 
 /* ---------------- Groq ---------------- */
-async function groqFetch(path, opts, intentos = 4, onWait) {
+class CupoError extends Error { constructor(msg, diario) { super(msg); this.cupo = true; this.diario = diario; } }
+async function groqFetch(path, opts, intentos = 5, onWait) {
   if (!cfg.groqKey) throw new Error('Falta la API key de Groq (Configuración).');
   for (let i = 0; i < intentos; i++) {
-    const r = await fetch('https://api.groq.com/openai/v1' + path, { ...opts, headers: { Authorization: 'Bearer ' + cfg.groqKey, ...(opts.headers || {}) } });
-    if (r.status === 429 && i < intentos - 1) {
+    let r;
+    try { r = await fetch('https://api.groq.com/openai/v1' + path, { ...opts, headers: { Authorization: 'Bearer ' + cfg.groqKey, ...(opts.headers || {}) } }); }
+    catch (e) { if (i < intentos - 1) { onWait?.('Sin conexión con Groq, reintento en 10 s…'); await sleep(10000); continue; } throw new Error('Sin conexión con Groq: ' + e.message); }
+    if (r.status === 429) {
+      let msg = ''; try { msg = (await r.clone().json()).error?.message || ''; } catch { }
       const ra = parseFloat(r.headers.get('retry-after')) || 20;
-      onWait?.(`Se alcanzó el límite gratuito de Groq. Reintento en ${Math.ceil(ra)} s…`);
+      const diario = /per day|\(TPD\)|\(RPD\)|\(ASD\)|tokens per day|requests per day/i.test(msg) || ra > 120;
+      if (diario || i === intentos - 1) throw new CupoError(msg || 'Límite de Groq alcanzado', diario);
+      onWait?.(`Esperando el límite por minuto del plan gratuito de Groq (${Math.ceil(ra)} s)…`);
       await sleep((ra + 1) * 1000); continue;
     }
+    if (r.status >= 500 && i < intentos - 1) { onWait?.('Groq no respondió, reintento en 8 s…'); await sleep(8000); continue; }
     if (!r.ok) { let m = ''; try { m = (await r.json()).error?.message; } catch { } throw new Error(m || 'Error de Groq ' + r.status); }
     return r;
   }
@@ -729,10 +736,18 @@ async function transcribirDetalle(blob, nombre) {
     return { start: +s.start || 0, end: +s.end || 0, text: t.trim() };
   }).filter(s => s.text);
 }
-/* ---- modelos: se eligen según lo que tu key tenga disponible en Groq ---- */
-const PREF_TEXTO = ['llama-3.3-70b-versatile', 'openai/gpt-oss-120b', 'meta-llama/llama-4-scout-17b-16e-instruct', 'qwen/qwen3-32b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant'];
-const TPM = { 'llama-3.3-70b-versatile': 12000, 'openai/gpt-oss-120b': 8000, 'openai/gpt-oss-20b': 8000, 'meta-llama/llama-4-scout-17b-16e-instruct': 30000, 'qwen/qwen3-32b': 6000, 'llama-3.1-8b-instant': 6000 };
+/* ---- modelos: cada tarea usa un modelo distinto para repartir los cupos diarios del plan gratuito ----
+   (en Groq gratis cada modelo tiene su propio cupo: ~8.000 tokens por minuto y ~200.000 por día) */
+const ROLES = {
+  vivo: ['openai/gpt-oss-20b', /qwen/, 'openai/gpt-oss-120b', 'llama-3.1-8b-instant', 'llama-3.3-70b-versatile'],
+  resumen: [/qwen/, 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'llama-3.1-8b-instant', 'llama-3.3-70b-versatile'],
+  equipos: ['openai/gpt-oss-20b', /qwen/, 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile'],
+  subs: [/qwen/, 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile'],
+  redaccion: ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', /qwen/, 'openai/gpt-oss-20b', 'meta-llama/llama-4-scout-17b-16e-instruct']
+};
+const TPM = { 'llama-3.3-70b-versatile': 12000, 'meta-llama/llama-4-scout-17b-16e-instruct': 30000, 'llama-3.1-8b-instant': 6000 };
 const tpmDe = m => TPM[m] || 8000;
+const NO_USAR = new Set();   // modelos sin acceso o sin cupo diario en esta sesión del navegador
 let MODELOS = null;
 async function modelosDisponibles() {
   if (MODELOS) return MODELOS;
@@ -740,34 +755,46 @@ async function modelosDisponibles() {
   catch { MODELOS = new Set(); }
   return MODELOS;
 }
-async function modeloTexto() {
-  const M = await modelosDisponibles();
-  if (!M.size || M.has(cfg.modeloTexto)) return cfg.modeloTexto;
-  return PREF_TEXTO.find(m => M.has(m)) || [...M].find(m => !/whisper|guard|tts|orpheus|playai|compound|allam|vision|-vl/i.test(m)) || cfg.modeloTexto;
+const esTexto = m => !/whisper|guard|tts|orpheus|playai|compound|allam|vision|-vl|prompt-guard/i.test(m);
+async function modeloPara(rol = 'redaccion') {
+  const M = await modelosDisponibles(), lista = ROLES[rol] || ROLES.redaccion;
+  const disponibles = M.size ? [...M].filter(m => esTexto(m) && !NO_USAR.has(m)) : [];
+  if (rol === 'redaccion' && cfg.modeloTexto && (!M.size || M.has(cfg.modeloTexto)) && !NO_USAR.has(cfg.modeloTexto)) return cfg.modeloTexto;
+  for (const p of lista) {
+    if (!M.size) { if (typeof p === 'string' && !NO_USAR.has(p)) return p; continue; }
+    const hit = typeof p === 'string' ? (disponibles.includes(p) ? p : null) : disponibles.find(m => p.test(m));
+    if (hit) return hit;
+  }
+  return disponibles[0] || null;
 }
-async function modeloVision() { const M = await modelosDisponibles(); return [...M].find(m => /llama-4|vision|-vl/i.test(m)) || null; }
-async function chat(messages, { json = true, max = 4000, temp = 0.2, onWait, model } = {}) {
-  let m = model || await modeloTexto();
-  for (let intento = 0; intento < 3; intento++) {
+const modeloTexto = () => modeloPara('redaccion');
+async function modeloVision() { const M = await modelosDisponibles(); return [...M].find(m => /llama-4|vision|-vl/i.test(m) && !NO_USAR.has(m)) || null; }
+async function chat(messages, { json = true, max = 2500, temp = 0.2, onWait, model, rol = 'redaccion' } = {}) {
+  let m = model || await modeloPara(rol);
+  for (let intento = 0; intento < 5; intento++) {
+    if (!m) throw new Error('No quedan modelos de Groq con cupo hoy. Probá más tarde o mañana.');
     const body = { model: m, messages, temperature: temp, max_completion_tokens: max };
     if (/gpt-oss/.test(m)) body.reasoning_effort = 'low';
     if (/qwen3/.test(m)) body.reasoning_effort = 'none';
     if (json) body.response_format = { type: 'json_object' };
     let r;
-    try { r = await groqFetch('/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, 4, onWait); }
+    try { r = await groqFetch('/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, 5, onWait); }
     catch (e) {
-      if (!model && /does not exist|decommission|not have access|model_not_found|not found/i.test(e.message)) {
-        MODELOS?.delete(m); const n = await modeloTexto();
-        if (n && n !== m) { m = n; onWait?.('Cambiando a un modelo disponible…'); continue; }
+      const sinAcceso = /does not exist|decommission|not have access|model_not_found|not found|not available/i.test(e.message);
+      if (sinAcceso || (e.cupo && e.diario)) {
+        NO_USAR.add(m); const n = await modeloPara(rol);
+        if (n && n !== m) { onWait?.(e.cupo ? `Se agotó el cupo diario de ${m}: sigo con ${n}…` : 'Cambiando a un modelo disponible…'); if (e.cupo) toast(`Cupo diario agotado en ${m}. Sigo con ${n}.`, '', 6000); m = n; continue; }
       }
+      if (/too large|reduce your message|context_length|maximum context/i.test(e.message) && max > 1200) { max = Math.floor(max * 0.7); onWait?.('Pedido muy grande para el plan gratuito, lo achico…'); continue; }
       throw e;
     }
     let txt = (await r.json()).choices?.[0]?.message?.content || '';
     txt = txt.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
     if (!json) return txt;
-    try { return JSON.parse(txt); } catch { const mm = txt.match(/\{[\s\S]*\}/); if (mm) return JSON.parse(mm[0]); throw new Error('El agente no devolvió un JSON válido. Probá de nuevo.'); }
+    try { return JSON.parse(txt); } catch { const mm = txt.match(/\{[\s\S]*\}/); if (mm) { try { return JSON.parse(mm[0]); } catch { } } if (intento < 4) { onWait?.('Respuesta incompleta, la pido de nuevo…'); continue; } throw new Error('El agente no devolvió un JSON válido. Probá de nuevo.'); }
   }
 }
+const recortar = (t, tokens) => { const max = Math.floor(tokens * 3.5); return t.length <= max ? t : t.slice(0, max) + '\n[…]'; };
 
 /* ---------------- prompts del agente (esqueleto de HU de Tokin) ---------------- */
 function sysBase(s) {
@@ -882,15 +909,6 @@ TAREA: partí la historia de usuario recibida en SUB-HISTORIAS, una por equipo, 
 ESQUEMA:
 {"subs":[{"equipo":"UX | Back | Front | Admin","aplica":true,"motivo_no_aplica":"","titulo":"verbo + objeto + contexto, propio del equipo","rol":"","quiero":"","para":"","descripcion":"qué resuelve este equipo, 2-3 líneas","tareas":[""],"criterios":[{"id":"CA-FE-01","dado":"","cuando":"","entonces":""}],"refs":["RN-01","CA-02"],"dependencias":[""],"puntos_abiertos":[""]}]}`;
 }
-async function redactarSubs(s, modelo, maxOut, hu, extra = '') {
-  const madre = clone(hu); delete madre.subs;
-  const r = await chat([
-    { role: 'system', content: sysSub(s) },
-    { role: 'user', content: `${contextoTexto(s, false)}\n\nHISTORIA MADRE (${hu.id}):\n${JSON.stringify(madre)}${extra}` }
-  ], { onWait: setGen, max: Math.min(maxOut, 4500), model: modelo });
-  const orden = EQUIPOS.map(e => e.k);
-  return arr(r.subs || r.subhistorias).map(normSub).filter(Boolean).sort((a, b) => orden.indexOf(a.equipo) - orden.indexOf(b.equipo));
-}
 function vivoRef(s) {
   const v = s.vivo; if (!v) return '';
   return `\n\nBORRADOR ARMADO EN VIVO DURANTE LA REUNIÓN (referencia; la transcripción manda):\n${JSON.stringify({ titulo: v.titulo, decisiones: v.decisiones, reglas: v.reglas.map(r => r.texto), dudas: v.dudas, subs: v.subs.map(x => ({ equipo: x.equipo, titulo: x.titulo })) })}`;
@@ -986,7 +1004,7 @@ async function abrirCaptura(fuente, onLevel) {
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   let streams = [], track;
   if (fuente === 'reunion') {
-    const d = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }, systemAudio: 'include', selfBrowserSurface: 'exclude', monitorTypeSurfaces: 'include' });
+    const d = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 1, max: 2 }, width: { max: 640 }, height: { max: 360 } }, audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }, systemAudio: 'include', selfBrowserSurface: 'exclude', monitorTypeSurfaces: 'include' });
     streams.push(d);
     if (!d.getAudioTracks().length) { d.getTracks().forEach(t => t.stop()); ctx.close(); throw new Error('No llegó audio. Elegí "Pantalla completa" y activá "Compartir audio del sistema".'); }
     track = new MediaStream(d.getAudioTracks());
@@ -1175,7 +1193,7 @@ TAREA: mantenés un BORRADOR EN VIVO de la historia de usuario de la iniciativa 
 - Lo que todavía no se habló queda como [A DEFINIR]. No inventes reglas ni números.
 - Sub-historias: SIEMPRE una por cada equipo pedido, en este orden: ${eqs.join(', ')}. Aunque todavía no se haya hablado de un equipo (por ejemplo Admin), incluila con título y "quiero" derivados de la historia general y lo que falte como [A DEFINIR] en "abiertos".
   · Front: tienda Tokin mobile/desktop. · Back: servicios, datos, integraciones. · Admin: carga y configuración en el Admin de Tokin. · UX: diseño final en Figma.
-- Sé breve: es un borrador que se lee en vivo.
+- Sé breve: es un borrador que se lee en vivo. Máximo 10 reglas, 8 criterios y 8 dudas; por equipo, máximo 6 tareas y 4 criterios. Fusioná lo repetido.
 ${s.previaId ? '- Es la continuación de una reunión anterior: el borrador actual ya trae lo de esa reunión. Sumá lo de hoy y sacá de "dudas" lo que hoy se respondió.' : ''}
 
 ESQUEMA:
@@ -1190,41 +1208,56 @@ function vivoClaves(v) {
   return new Set(k.filter(Boolean));
 }
 const VIVO_UI = {};   // por sesión: { estado, msg, nuevos:Set }
-function encolarVivo(s, fragmento, etiqueta) {
-  if (!fragmento?.trim() || !cfg.groqKey) return;
-  s._vivoCola = (s._vivoCola || Promise.resolve()).then(() => actualizarVivo(s, fragmento, etiqueta)).catch(() => { });
+const BLOQUE_TRAMOS = 2;   // cada 2 tramos (~6 min) se toman notas y se actualiza el borrador
+function encolarVivo(s, fragmento, etiqueta, forzar = false) {
+  if (!cfg.groqKey) return s._vivoCola;
+  s._buf = s._buf || [];
+  if (fragmento?.trim()) s._buf.push({ texto: fragmento, etiqueta });
+  if (!s._buf.length || (!forzar && s._buf.length < BLOQUE_TRAMOS)) {
+    if (s._buf.length) { const ui = VIVO_UI[s.id] = VIVO_UI[s.id] || {}; if (ui.estado !== 'run') { ui.estado = 'espera'; ui.msg = 'Se actualiza con el próximo tramo'; refrescarVivo(s); } }
+    return s._vivoCola;
+  }
+  const lote = s._buf.splice(0), texto = lote.map(x => x.texto).join('\n'), et = lote.length > 1 ? `${lote[0].etiqueta} a ${lote.at(-1).etiqueta.replace(/^tramo /, '')}` : lote[0].etiqueta;
+  s._vivoCola = (s._vivoCola || Promise.resolve()).then(() => procesarBloque(s, texto, et)).catch(e => console.warn(e));
   return s._vivoCola;
+}
+async function procesarBloque(s, texto, et) {
+  s.notasBloques = s.notasBloques || [];
+  const notas = chat([{ role: 'system', content: SYS_NOTAS }, { role: 'user', content: recortar(texto, 5500) }], { json: false, max: 600, rol: 'resumen' })
+    .then(n => { s.notasBloques.push({ et, texto: n }); s.notasChars = (s.notasChars || 0) + texto.length; })
+    .catch(e => console.warn('notas', e));
+  const vivo = s.vivoActivo !== false ? actualizarVivo(s, texto, et) : null;
+  await Promise.all([notas, vivo]);
+  await Store.guardar(s).catch(() => { });
 }
 async function actualizarVivo(s, fragmento, etiqueta) {
   const ui = VIVO_UI[s.id] = VIVO_UI[s.id] || {};
   ui.estado = 'run'; ui.msg = `Actualizando con ${etiqueta}…`; refrescarVivo(s);
   try {
-    const modelo = await modeloTexto(), T = tpmDe(modelo), maxOut = Math.min(3500, Math.floor(T * 0.35));
-    const actual = s.vivo ? clone({ ...s.vivo, tramos: undefined, actualizado: undefined }) : null;
-    const lugar = T - maxOut - estimTokens(sysVivo(s) + contextoTexto(s, false) + JSON.stringify(actual || {})) - 600;
-    const partes = estimTokens(fragmento) > lugar ? partir(fragmento, Math.max(3000, Math.floor(lugar * 3.4))) : [fragmento];
+    const maxOut = 2200, actual = s.vivo ? clone({ ...s.vivo, tramos: undefined, actualizado: undefined }) : null;
+    const lugar = 8000 - maxOut - estimTokens(sysVivo(s) + contextoTexto(s, false) + JSON.stringify(actual || {})) - 500;
+    const partes = estimTokens(fragmento) > lugar ? partir(fragmento, Math.max(2500, Math.floor(lugar * 3.4))) : [fragmento];
     let borrador = actual;
     for (let i = 0; i < partes.length; i++) {
       const res = await chat([
         { role: 'system', content: sysVivo(s) },
         { role: 'user', content: `${contextoTexto(s, false)}\n\nBORRADOR ACTUAL:\n${borrador ? JSON.stringify(borrador) : '(todavía no hay borrador: crealo)'}\n\nNUEVO FRAGMENTO DE LA REUNIÓN (${etiqueta}${partes.length > 1 ? `, parte ${i + 1}/${partes.length}` : ''}):\n${partes[i]}` }
-      ], { onWait: m => { ui.msg = m; refrescarVivo(s); }, max: maxOut, model: modelo });
+      ], { onWait: m => { ui.msg = m; refrescarVivo(s); }, max: maxOut, rol: 'vivo' });
       borrador = normVivo(res); delete borrador.tramos; delete borrador.actualizado;
     }
     const antes = vivoClaves(s.vivo);
     s.vivo = normVivo({ ...borrador, tramos: (s.vivo?.tramos || 0) + 1, actualizado: Date.now() });
     ui.nuevos = new Set([...vivoClaves(s.vivo)].filter(k => !antes.has(k)));
     ui.estado = 'ok'; ui.msg = '';
-    await Store.guardar(s).catch(() => { });
   } catch (e) { ui.estado = 'error'; ui.msg = 'No se pudo actualizar: ' + e.message; }
   refrescarVivo(s);
 }
 async function vivoDesdeTranscripcion(s) {
   const t = s.transcripcion.trim(); if (!t) return toast('No hay transcripción todavía.');
   if (s.vivo && !confirm('Se rehace el borrador en vivo desde cero con toda la transcripción. ¿Seguimos?')) return;
-  s.vivo = null; VIVO_UI[s.id] = { estado: 'run', msg: 'Preparando…' }; refrescarVivo(s);
+  s.vivo = null; s.notasBloques = []; s.notasChars = 0; s._buf = []; VIVO_UI[s.id] = { estado: 'run', msg: 'Preparando…' }; refrescarVivo(s);
   const partes = partir(t, 9000);
-  for (let i = 0; i < partes.length; i++) await encolarVivo(s, partes[i], `parte ${i + 1} de ${partes.length} de la transcripción`);
+  for (let i = 0; i < partes.length; i++) await encolarVivo(s, partes[i], `parte ${i + 1} de ${partes.length}`, true);
 }
 function refrescarVivo(s) {
   if (S !== s || VISTA !== 'sesion') return;
@@ -1253,7 +1286,7 @@ function panelVivo(s) {
   const v = s.vivo, ui = VIVO_UI[s.id] || {}, nuevos = ui.nuevos || new Set();
   const nv = (k) => nuevos.has(k) ? ' nuevo' : '';
   const grabando = REC.activo && REC.sid === s.id;
-  const estado = ui.estado === 'run' ? `<span class="chip y"><span class="spin" style="width:12px;height:12px;border-width:2px"></span>${esc(ui.msg || 'Actualizando…')}</span>`
+  const estado = ui.estado === 'espera' ? `<span class="chip gray">${ic('clock')}${esc(ui.msg)}</span>` : ui.estado === 'run' ? `<span class="chip y"><span class="spin" style="width:12px;height:12px;border-width:2px"></span>${esc(ui.msg || 'Actualizando…')}</span>`
     : ui.estado === 'error' ? `<span class="chip err">${esc(ui.msg)}</span>`
       : v ? `<span class="chip ok">${ic('check')}Actualizado ${new Date(v.actualizado).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })} · ${v.tramos} ${v.tramos === 1 ? 'actualización' : 'actualizaciones'}</span>` : '';
   const head = `<div class="chead"><div><h3><span class="dot ${grabando ? 'rec' : v ? 'live' : ''}"></span>Historia en vivo</h3><p class="sub">${s.vivoActivo === false ? 'Desactivada: activala en la tarjeta de grabación.' : grabando ? 'Se actualiza sola con cada tramo de la reunión (cada 3 minutos). Lo nuevo aparece resaltado.' : 'Se arma mientras grabás. También podés armarla con una transcripción pegada o importada.'}</p></div>
@@ -1640,6 +1673,10 @@ function refrescarRecUI() {
 function pickMime() { return ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'].find(m => window.MediaRecorder?.isTypeSupported?.(m)) || ''; }
 const extDe = m => m.includes('mp4') ? 'mp4' : m.includes('ogg') ? 'ogg' : 'webm';
 
+let WAKE = null;
+async function pedirWakeLock() { try { if ('wakeLock' in navigator && !WAKE) { WAKE = await navigator.wakeLock.request('screen'); WAKE.addEventListener('release', () => { WAKE = null; }); } } catch { } }
+function liberarWakeLock() { try { WAKE?.release(); } catch { } WAKE = null; }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && REC.activo) pedirWakeLock(); });
 async function iniciarGrabacion() {
   if (!cfg.groqKey) { toast('Primero conectá Groq para poder transcribir.', 'error'); return abrirConfig(); }
   if (!S.consentimiento) return toast('Confirmá que avisaste a los participantes que se graba.', 'error');
@@ -1653,7 +1690,7 @@ async function iniciarGrabacion() {
     const merger = ctx.createChannelMerger(2);
     let disp = null, mic = null;
     if (S.modoGrabacion === 'virtual') {
-      try { disp = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }, systemAudio: 'include', selfBrowserSurface: 'exclude', monitorTypeSurfaces: 'include' }); }
+      try { disp = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 1, max: 2 }, width: { max: 640 }, height: { max: 360 } }, audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }, systemAudio: 'include', selfBrowserSurface: 'exclude', monitorTypeSurfaces: 'include' }); }
       catch { ctx.close(); throw new Error('No se compartió la pantalla o la pestaña de la reunión.'); }
       streams.push(disp);
       if (!disp.getAudioTracks().length) { disp.getTracks().forEach(t => t.stop()); ctx.close(); throw new Error('No llegó audio de la reunión. Volvé a intentar y activá “Compartir audio del sistema” (o “de la pestaña”).'); }
@@ -1691,7 +1728,7 @@ async function iniciarGrabacion() {
     nuevoSegmento(REC);
     REC.timerSeg = setInterval(() => rotarSegmento(REC), SEG_MS);
     REC.tick = setInterval(() => { const r = $('#reloj'); if (r && REC.activo && S?.id === REC.sid) r.textContent = fmtT(Date.now() - REC.inicio); }, 500);
-    renderSesion(); pintarStatus();
+    renderSesion(); pintarStatus(); pedirWakeLock();
     toast('Grabando', 'ok');
   } catch (e) { streams.forEach(s => s.getTracks().forEach(t => t.stop())); toast(e.message, 'error'); }
 }
@@ -1721,7 +1758,7 @@ async function procesarSegmento(R, idx, blob, ext) {
     R.estadoSegs[idx] = 'ok'; delete R.fallidos[idx];
   } catch (e) { R.estadoSegs[idx] = 'error'; R.fallidos[idx] = { blob, ext }; toast(`Tramo ${idx + 1}: ${e.message}`, 'error', 6000); }
   armarTranscripcion(R); refrescarRecUI();
-  if (R.sesion.vivoActivo !== false && R.segs[idx]) encolarVivo(R.sesion, R.segs[idx], `tramo ${idx + 1}`);
+  if (R.segs[idx]) encolarVivo(R.sesion, R.segs[idx], `tramo ${idx + 1}`);
 }
 // ¿Qué proporción del tramo [a,b] (en segundos) hablaste vos?
 function fraccionYo(F, a, b) {
@@ -1746,7 +1783,9 @@ async function etiquetarSegmentos(R, idx, segs) {
     }
     items.push({ who, start: a, end: b, text: sg.text });
   }
-  const next = R.ctxOffsets[idx + 1]; if (next && R.pcm?.dropBefore) R.pcm.dropBefore(Math.floor((next - 2) * 16000));
+  const next = R.ctxOffsets[idx + 1];
+  if (next && R.pcm?.dropBefore) R.pcm.dropBefore(Math.floor((next - 2) * 16000));
+  if (next && R.frames?.length) { let k = 0; while (k < R.frames.length && R.frames[k] < next - 5) k += 2; if (k) R.frames.splice(0, k); }
   const lines = [];
   for (const it of items) { const last = lines.at(-1); if (last && last.who === it.who && it.start - last.end < 6) { last.text += ' ' + it.text; last.end = it.end; } else lines.push({ ...it }); }
   return lines.map(l => `[${fmtT(l.start * 1000)}] ${l.who ? l.who + ': ' : ''}${l.text}`).join('\n');
@@ -1769,6 +1808,8 @@ async function detenerGrabacion() {
   await R.cola;
   armarTranscripcion(R);
   await Store.guardar(R.sesion).catch(() => { });
+  encolarVivo(R.sesion, '', '', true);
+  liberarWakeLock();
   const err = Object.keys(R.fallidos).length;
   toast(err ? `Transcripción lista con ${err} tramo(s) con error. Podés reintentarlos.` : 'Transcripción completa', err ? 'error' : 'ok', 5000);
   if (S === R.sesion && VISTA === 'sesion') renderSesion();
@@ -2025,26 +2066,109 @@ function bloqueArea(k, titulo, icono, items) {
 }
 
 /* ---- generación en 2 fases: minuta + una llamada por historia ---- */
+/* ---- generación pensada para reuniones largas (2 h) con el plan gratuito de Groq ----
+   · Durante la grabación, cada bloque de ~6 min se resume en notas (modelo "resumen").
+   · Al final, las historias se arman desde esas notas: no hace falta releer 2 h de transcripción.
+   · Cada historia se redacta en 2 pedidos chicos (núcleo + equipos) para entrar en 8.000 tokens/min,
+     y los equipos y las sub-historias usan otros modelos en paralelo para repartir los cupos. */
 function setGen(msg) { GEN.msg = msg; const el = $('#genmsg') || $('#genDisenoMsg'); if (el) el.textContent = msg; }
-async function prepararMaterial(s, modelo, T, sysMax, extra = 0) {
-  const lugar = T - Math.min(6000, Math.floor(T * 0.45)) - estimTokens(sysMax + contextoTexto(s)) - extra - 700;
-  let material = s.transcripcion.trim(), etiqueta = 'TRANSCRIPCIÓN DE LA REUNIÓN';
-  for (let ronda = 0; ronda < 3 && estimTokens(material) > lugar; ronda++) {
-    const tamParte = Math.max(6000, Math.floor((T - 2400 - 600) * 3.4));
-    const partes = partir(material, tamParte), notas = [];
-    for (let i = 0; i < partes.length; i++) {
-      setGen(`Reunión larga: resumiendo parte ${i + 1} de ${partes.length}…`);
-      notas.push(await chat([{ role: 'system', content: 'Sos analista funcional de Producto. Extraé de este fragmento de una reunión de refinamiento TODO lo relevante en viñetas concisas, separando DECISIONES de IDEAS: requerimientos, reglas de negocio (números, límites, vigencias, unidades, países), temas de UX, IT Front, IT Back y QA, dudas abiertas, contradicciones y acciones con responsable. Indicá quién lo dijo si figura. Mantené frases textuales clave entre comillas. En español, sin introducción.' }, { role: 'user', content: partes[i] }], { json: false, max: 1800, onWait: setGen, model: modelo }));
-    }
-    material = notas.map((n, i) => `--- Parte ${i + 1} ---\n${n}`).join('\n\n'); etiqueta = 'NOTAS EXTRAÍDAS DE LA REUNIÓN (reunión larga, procesada por partes)';
-  }
-  return `${etiqueta}:\n${material || '(sin transcripción: usá las notas y el contexto)'}`;
+const SYS_NOTAS = 'Sos analista funcional de Producto de Tokin (tienda B2B de Arcor). Tomá notas de este fragmento de una reunión de refinamiento en viñetas MUY concisas, agrupadas así (omití los grupos vacíos): DECISIONES · IDEAS (no decididas) · REGLAS (con números, límites, vigencias, unidades, países) · UX · IT FRONT · IT BACK · ADMIN · QA · DUDAS · CONTRADICCIONES · ACCIONES (con responsable). Indicá quién lo dijo si figura. Frases textuales clave entre comillas. Máximo 220 palabras. En español, sin introducción.';
+function partir(t, n) {
+  const out = []; let i = 0;
+  while (i < t.length) { let j = Math.min(t.length, i + n); if (j < t.length) { const k = Math.max(t.lastIndexOf('\n', j), t.lastIndexOf('. ', j)); if (k > i + n * 0.6) j = k + 1; } out.push(t.slice(i, j)); i = j; }
+  return out;
 }
-async function redactarHU(s, modelo, maxOut, material, plan, i, extra = '') {
-  return normHU(await chat([
-    { role: 'system', content: sysHU(s) },
-    { role: 'user', content: `${contextoTexto(s)}\n\n${minutaTexto(s.resultado)}\n\n${material}\n\nHISTORIA A REDACTAR: HU-${pad2(i + 1)} · ${plan.titulo}${plan.epica ? ` · Épica: ${plan.epica}` : ''}\nFoco: ${plan.foco || '—'}${extra}` }
-  ], { onWait: setGen, max: maxOut, model: modelo }), i);
+// Comprime un texto largo a ~presupuesto tokens, resumiendo por partes con 2 modelos en paralelo.
+async function comprimirHasta(texto, presupuesto, etiqueta) {
+  for (let ronda = 0; ronda < 4 && estimTokens(texto) > presupuesto; ronda++) {
+    const partes = partir(texto, 17000), notas = new Array(partes.length); let hechas = 0;
+    const tarea = async (i) => {
+      notas[i] = await chat([{ role: 'system', content: SYS_NOTAS }, { role: 'user', content: partes[i] }], { json: false, max: 900, rol: i % 2 ? 'vivo' : 'resumen', onWait: setGen });
+      setGen(`Reunión larga: resumiendo ${++hechas} de ${partes.length} partes${ronda ? ' (segunda pasada)' : ''}…`);
+    };
+    setGen(`Reunión larga: resumiendo ${partes.length} partes…`);
+    for (let i = 0; i < partes.length; i += 2) await Promise.all([tarea(i), i + 1 < partes.length ? tarea(i + 1) : null]);
+    texto = notas.map((n, i) => `--- Parte ${i + 1} ---\n${n}`).join('\n\n'); etiqueta = 'NOTAS DE LA REUNIÓN (resumida por partes)';
+  }
+  return `${etiqueta}:\n${recortar(texto, presupuesto)}`;
+}
+async function materialFinal(s, presupuesto = 2400) {
+  const t = s.transcripcion.trim();
+  const clave = `${t.length}|${(s.notasBloques || []).length}|${presupuesto}`;
+  if (s._material?.clave === clave) return s._material.texto;
+  let texto;
+  if (!t && !(s.notasBloques || []).length) texto = 'TRANSCRIPCIÓN:\n(sin transcripción: usá las notas de Producto y el contexto)';
+  else if ((s.notasBloques || []).length && (s.notasChars || 0) >= t.length * 0.85)
+    texto = await comprimirHasta(s.notasBloques.map(n => `--- ${n.et} ---\n${n.texto}`).join('\n\n'), presupuesto, 'NOTAS DE LA REUNIÓN (tomadas en vivo cada ~6 min)');
+  else texto = await comprimirHasta(t, presupuesto, 'TRANSCRIPCIÓN DE LA REUNIÓN');
+  s._material = { clave, texto };
+  return texto;
+}
+const ESQ_A = `{"titulo":"verbo en infinitivo + objeto + contexto","epica":"","prioridad":"Alta | Media | Baja","pais":"AR | CL | Ambos","plataforma":"Mobile | Desktop | Ambas | Admin","objetivo":"objetivo o KPI, o [A DEFINIR]","estado":"Borrador | Lista para refinar | Lista para desarrollo",
+"contexto":"2-4 líneas: qué pasa hoy, qué problema genera y para quién","rol":"","quiero":"","para":"",
+"incluye":[""],"fuera_de_alcance":[""],"reglas":[{"id":"RN-01","texto":""}],
+"criterios":[{"id":"CA-01","escenario":"","dado":"","cuando":"","entonces":"","y":[""]}],
+"preguntas":[{"pregunta":"","responsable":"Producto | UX | IT | QA","estado":"Abierta"}],"citas":["Quién: frase textual corta"]}`;
+const ESQ_B = `{"ux":{"figma":"","pantallas":[""],"estados":[""],"textos":[""],"mobile_desktop":"","accesibilidad":""},
+"front":{"componentes":[""],"logica":["cuándo se muestra / oculta (RN-XX)"],"validaciones":[""],"errores":[""],"analitica":["evento GA4 · parámetros"],"responsive":""},
+"back":{"endpoints":["método · ruta, o [A DEFINIR por IT]"],"datos":[""],"integraciones":[""],"reglas_back":["RN-XX"],"performance_seguridad":[""],"migracion":""},
+"qa":{"casos":["CP-01 (CA-01): …"],"datos_prueba":[""],"ambiente":"","regresion":[""],"criterio_salida":""},
+"medicion":{"kpi":"","como":"","base_meta":""},"dependencias":{"equipos":[""],"necesidades":[""],"comunicacion":"","mesa_ayuda":""},
+"checklist":{"puntaje":0,"falta":"","partir":"No"}}`;
+function sysHUa(s) {
+  return sysBase(s) + `
+
+TAREA: redactá el NÚCLEO de UNA historia de usuario (la indicada) con el esqueleto de Tokin: encabezado, contexto, historia, alcance, reglas, criterios y preguntas.
+- Título: verbo en infinitivo + objeto + contexto. "rol": el actor real, nunca "el sistema".
+- Reglas RN-01…: verificables, con montos, cantidades, vigencias, topes, unidades y países explícitos.
+- Criterios CA-01… en Gherkin: mínimo 1 camino feliz + 1 alternativo + 1 error/borde; cada CA prueba una sola cosa; citá RN-XX.
+- Lo que falte: [A DEFINIR] y va a preguntas. Sé conciso: máximo 10 reglas y 8 criterios.
+
+ESQUEMA:
+${ESQ_A}`;
+}
+function sysHUb(s) {
+  return sysBase(s) + `
+
+TAREA: recibís el núcleo de una historia de usuario y completás las secciones por equipo del esqueleto de Tokin: UX, IT Front, IT Back, QA, medición, dependencias y el checklist.
+- Front y Back con responsabilidades separadas, citando RN-XX. QA: un caso por CA (CA-01 → CP-01…), datos de prueba y regresión.
+- Si no aplica: "No aplica". Lo que falte: [A DEFINIR]. Listas de máximo 6 ítems, frases cortas.
+- Checklist (sobre la historia completa): para qué con beneficio real 15 · reglas completas 20 · CA feliz+alternativo+error 20 · UX con estados y textos 10 · Front/Back separados 10 · QA con datos y regresión 10 · medición 5 · fuera de alcance 5 · preguntas 5. Si es menor a 70, la historia queda en Borrador.
+
+ESQUEMA:
+${ESQ_B}`;
+}
+async function redactarNucleo(s, material, plan, i, extra = '') {
+  const sys = sysHUa(s), base = `${contextoTexto(s)}\n\n${minutaTexto(s.resultado)}`;
+  const tail = `\n\nHISTORIA A REDACTAR: HU-${pad2(i + 1)} · ${plan.titulo}${plan.epica ? ` · Épica: ${plan.epica}` : ''}\nFoco: ${plan.foco || '—'}${extra}`;
+  const libre = 8000 - 2300 - estimTokens(sys + base + tail) - 500;
+  return chat([{ role: 'system', content: sys }, { role: 'user', content: `${base}\n\n${recortar(material, Math.max(800, libre))}${tail}` }], { onWait: setGen, max: 2300, rol: 'redaccion' });
+}
+async function redactarEquipos(s, hu, material) {
+  const sys = sysHUb(s), nucleo = JSON.stringify(huCompacta(hu)), base = `${contextoTexto(s)}\n\nNÚCLEO DE LA HISTORIA (${hu.id}):\n${nucleo}`;
+  const libre = 8000 - 2300 - estimTokens(sys + base) - 500;
+  return chat([{ role: 'system', content: sys }, { role: 'user', content: `${base}\n\n${recortar(material, Math.max(500, libre))}` }], { onWait: setGen, max: 2300, rol: 'equipos' });
+}
+async function redactarSubs(s, _m, _x, hu, extra = '') {
+  const madre = huCompacta(hu);
+  const r = await chat([
+    { role: 'system', content: sysSub(s) },
+    { role: 'user', content: `${contextoTexto(s, false)}\n\nHISTORIA MADRE (${hu.id}):\n${JSON.stringify(madre)}${extra}` }
+  ], { onWait: setGen, max: 2600, rol: 'subs' });
+  const orden = EQUIPOS.map(e => e.k);
+  return arr(r.subs || r.subhistorias).map(normSub).filter(Boolean).sort((a, b) => orden.indexOf(a.equipo) - orden.indexOf(b.equipo));
+}
+function repintarHistorias(s) { if (S === s && VISTA === 'sesion' && TAB === 'historias' && !document.activeElement?.isContentEditable) renderSesion(); }
+// Completa equipos (B) y sub-historias en paralelo, con otros modelos.
+async function completarHU(s, hu, material, conSubs = s.subActivas !== false) {
+  hu._pendiente = true;
+  const tareas = [
+    (async () => { try { const b = await redactarEquipos(s, hu, material); const idx = s.resultado.historias.indexOf(hu); const m = normHU({ ...hu, ...b }, idx < 0 ? 0 : idx); ['ux', 'front', 'back', 'qa', 'medicion', 'dependencias', 'checklist', 'estado'].forEach(k => hu[k] = m[k]); } catch (e) { toast(`${hu.id}: no se pudieron completar las secciones por equipo (${e.message})`, 'error', 7000); } })(),
+    conSubs ? (async () => { try { hu.subs = await redactarSubs(s, null, null, hu); } catch (e) { toast(`${hu.id}: no se pudieron armar las sub-historias (${e.message})`, 'error', 7000); } })() : null
+  ].filter(Boolean);
+  await Promise.all(tareas);
+  delete hu._pendiente;
+  await Store.guardar(s).catch(() => { }); repintarHistorias(s);
 }
 async function generar() {
   const s = S;
@@ -2052,77 +2176,64 @@ async function generar() {
   if (s.resultado && !confirm('Se va a regenerar todo y se pierden las ediciones manuales. ¿Seguimos?')) return;
   GEN = { activo: true, sid: s.id, msg: 'Preparando…' }; TAB = 'historias'; s.resultado = null; renderSesion();
   try {
+    if (s._vivoCola) { setGen('Terminando de procesar el último tramo de la reunión…'); await s._vivoCola; }
     if ((s.imagenes || []).length && !s.analisisDiseno.trim()) { s.analisisDiseno = await leerDiseno(setGen); guardarLuego(s); }
-    const modelo = await modeloTexto(), T = tpmDe(modelo), maxOut = Math.min(6000, Math.floor(T * 0.45));
-    const material = (await prepararMaterial(s, modelo, T, sysHU(s), 400 + estimTokens(vivoRef(s)) + (s._previa?.resultado?.historias?.length ? 1800 : 0))) + vivoRef(s);
+    const material = (await materialFinal(s)) + vivoRef(s);
     setGen('Armando la minuta y el plan de historias…');
-    const min = await chat([{ role: 'system', content: sysMinuta(s) }, { role: 'user', content: `${contextoTexto(s)}${historiasPrevias(s)}\n\n${material}` }], { onWait: setGen, max: Math.min(2500, maxOut), model: modelo });
+    const min = await chat([{ role: 'system', content: sysMinuta(s) }, { role: 'user', content: `${contextoTexto(s)}${historiasPrevias(s)}\n\n${material}` }], { onWait: setGen, max: 1800, rol: 'redaccion' });
     const plan = arr(min.historias).map(p => ({ titulo: toStr(p.titulo || ''), epica: toStr(p.epica || ''), foco: toStr(p.foco || ''), base: toStr(p.base || '').toUpperCase().match(/HU-\d+/)?.[0] || '', cambios: p.cambios !== false })).filter(p => p.titulo);
     s.resultado = normRes({ ...min, historias: [], plan });
-    await Store.guardar(s); if (S === s) renderSesion();
+    await Store.guardar(s); repintarHistorias(s);
+    const pendientes = [];
     for (let i = 0; i < plan.length; i++) {
-      setGen(`Redactando ${'HU-' + pad2(i + 1)} de ${plan.length}: ${plan[i].titulo}…`);
       const previa = plan[i].base && (s._previa?.resultado?.historias || []).find(h => h.id === plan[i].base);
-      let hu;
       if (previa && !plan[i].cambios) {
-        hu = normHU(clone(previa), i); hu.subs = clone(previa.subs || []);
-        s.resultado.historias.push(hu); await Store.guardar(s); if (S === s && VISTA === 'sesion' && TAB === 'historias') renderSesion();
-        continue;
+        const hu = normHU(clone(previa), i); hu.subs = clone(previa.subs || []);
+        s.resultado.historias.push(hu); await Store.guardar(s); repintarHistorias(s); continue;
       }
-      hu = await redactarHU(s, modelo, maxOut, material, plan[i], i, previa ? `\n\nVERSIÓN ANTERIOR DE ESTA HISTORIA (${previa.id}, Parte ${s._previa.parte || 1}): actualizala con lo nuevo de esta reunión, conservá lo que no cambió, mantené la numeración de RN y CA existentes y sacá de preguntas lo que hoy se respondió:\n${JSON.stringify(huCompacta(previa))}` : '');
-      s.resultado.historias.push(hu);
-      if (s.subActivas !== false) {
-        await Store.guardar(s); if (S === s && VISTA === 'sesion' && TAB === 'historias') renderSesion();
-        setGen(`Armando sub-historias por equipo de ${hu.id}…`);
-        try { hu.subs = await redactarSubs(s, modelo, maxOut, hu); } catch (e) { toast(`${hu.id}: no se pudieron armar las sub-historias (${e.message})`, 'error', 6000); }
-      }
-      await Store.guardar(s); if (S === s && VISTA === 'sesion' && TAB === 'historias') renderSesion();
+      setGen(`Redactando HU-${pad2(i + 1)} de ${plan.length}: ${plan[i].titulo}…`);
+      const extra = previa ? `\n\nVERSIÓN ANTERIOR DE ESTA HISTORIA (${previa.id}, Parte ${s._previa.parte || 1}): actualizala con lo nuevo, conservá lo que no cambió, mantené la numeración de RN y CA y sacá de preguntas lo que hoy se respondió:\n${JSON.stringify(huCompacta(previa))}` : '';
+      const hu = normHU(await redactarNucleo(s, material, plan[i], i, extra), i);
+      s.resultado.historias.push(hu); await Store.guardar(s); repintarHistorias(s);
+      pendientes.push(completarHU(s, hu, material));
     }
+    if (pendientes.length) { setGen('Completando equipos y sub-historias (Front, Back, Admin, UX)…'); await Promise.all(pendientes); }
     toast(`Listo: ${s.resultado.historias.length} historias con el esqueleto de Tokin`, 'ok');
-  } catch (e) { toast('No se pudo generar: ' + e.message, 'error', 8000); }
+  } catch (e) { toast('No se pudo generar: ' + e.message, 'error', 9000); }
   GEN = { activo: false, msg: '' };
   if (S === s) renderSesion();
-}
-function partir(t, n) {
-  const out = []; let i = 0;
-  while (i < t.length) { let j = Math.min(t.length, i + n); if (j < t.length) { const k = Math.max(t.lastIndexOf('\n', j), t.lastIndexOf('. ', j)); if (k > i + n * 0.6) j = k + 1; } out.push(t.slice(i, j)); i = j; }
-  return out;
 }
 async function ajustar() {
   const s = S, pedido = $('#ajuste')?.value.trim(); if (!pedido) return toast('Escribí qué querés ajustar.');
   const target = $('#ajTarget')?.value || 'minuta';
   GEN = { activo: true, sid: s.id, msg: 'Ajustando…' }; renderSesion();
   try {
-    const modelo = await modeloTexto(), T = tpmDe(modelo), maxOut = Math.min(6000, Math.floor(T * 0.45));
     if (target === 'minuta') {
       const actual = clone({ ...s.resultado, historias: undefined });
       const res = await chat([
         { role: 'system', content: sysMinuta(s) + '\n\nAhora recibís la minuta actual y un pedido de ajuste de Producto. Devolvé la minuta COMPLETA actualizada con el mismo esquema, manteniendo lo que no se pidió cambiar.' },
         { role: 'user', content: `${contextoTexto(s, false)}\n\nMINUTA ACTUAL:\n${JSON.stringify(actual)}\n\nPEDIDO DE AJUSTE:\n${pedido}` }
-      ], { onWait: setGen, max: Math.min(2500, maxOut), model: modelo });
+      ], { onWait: setGen, max: 1800, rol: 'redaccion' });
       const hs = s.resultado.historias, plan = s.resultado.plan;
       s.resultado = normRes({ ...res, historias: [], plan }); s.resultado.historias = hs;
+    } else if (target.startsWith('subs:')) {
+      const hu = s.resultado.historias[+target.slice(5)];
+      setGen(`Rehaciendo sub-historias de ${hu.id}…`);
+      hu.subs = await redactarSubs(s, null, null, hu, `\n\nPEDIDO DE AJUSTE DE PRODUCTO PARA LAS SUB-HISTORIAS:\n${pedido}\n\nSUB-HISTORIAS ACTUALES (resumen):\n${JSON.stringify(hu.subs.map(x => ({ equipo: x.equipo, titulo: x.titulo, tareas: x.tareas })))}`);
     } else {
-      const material = await prepararMaterial(s, modelo, T, sysHU(s), target === 'nueva' ? 600 : 2500);
+      const material = await materialFinal(s);
       if (target === 'nueva') {
-        setGen('Redactando la historia nueva…');
         const i = s.resultado.historias.length;
-        const hu = await redactarHU(s, modelo, maxOut, material, { titulo: '(definir según el pedido)', foco: pedido }, i, `\n\nPEDIDO DE PRODUCTO PARA ESTA HISTORIA NUEVA:\n${pedido}`);
-        if (s.subActivas !== false) { setGen(`Armando sub-historias de ${hu.id}…`); try { hu.subs = await redactarSubs(s, modelo, maxOut, hu); } catch { } }
+        setGen('Redactando la historia nueva…');
+        const hu = normHU(await redactarNucleo(s, material, { titulo: '(definir según el pedido)', foco: pedido }, i, `\n\nPEDIDO DE PRODUCTO PARA ESTA HISTORIA NUEVA:\n${pedido}`), i);
         s.resultado.historias.push(hu); s.resultado.plan.push({ titulo: hu.titulo, epica: hu.epica, foco: pedido });
-      } else if (target.startsWith('subs:')) {
-        const i = +target.slice(5), hu = s.resultado.historias[i];
-        setGen(`Rehaciendo sub-historias de ${hu.id}…`);
-        hu.subs = await redactarSubs(s, modelo, maxOut, hu, `\n\nPEDIDO DE AJUSTE DE PRODUCTO PARA LAS SUB-HISTORIAS:\n${pedido}\n\nSUB-HISTORIAS ACTUALES:\n${JSON.stringify(hu.subs)}`);
+        setGen(`Completando equipos y sub-historias de ${hu.id}…`); await completarHU(s, hu, material);
       } else {
-        const i = +target, actual = clone(s.resultado.historias[i]); delete actual.id; const subsPrev = actual.subs; delete actual.subs;
-        setGen(`Ajustando ${s.resultado.historias[i].id}…`);
-        const hu = normHU(await chat([
-          { role: 'system', content: sysHU(s) + '\n\nAhora recibís la historia actual y un pedido de ajuste de Producto. Devolvé la historia COMPLETA actualizada con el mismo esquema, manteniendo lo que no se pidió cambiar y recalculando el checklist.' },
-          { role: 'user', content: `${contextoTexto(s)}\n\n${material}\n\nHISTORIA ACTUAL:\n${JSON.stringify(actual)}\n\nPEDIDO DE AJUSTE:\n${pedido}` }
-        ], { onWait: setGen, max: maxOut, model: modelo }), i);
-        s.resultado.historias[i] = hu;
-        if (subsPrev?.length) { setGen(`Actualizando sub-historias de ${hu.id}…`); try { hu.subs = await redactarSubs(s, modelo, maxOut, hu); } catch { hu.subs = normHU({ subs: subsPrev }, i).subs; } }
+        const i = +target, prev = s.resultado.historias[i];
+        setGen(`Ajustando ${prev.id}…`);
+        const hu = normHU(await redactarNucleo(s, material, { titulo: prev.titulo, epica: prev.epica, foco: 'ajustar la historia actual' }, i, `\n\nHISTORIA ACTUAL:\n${JSON.stringify(huCompacta(prev))}\n\nPEDIDO DE AJUSTE DE PRODUCTO (aplicalo y conservá lo demás):\n${pedido}`), i);
+        hu.subs = prev.subs; s.resultado.historias[i] = hu;
+        setGen(`Actualizando equipos${prev.subs?.length ? ' y sub-historias' : ''} de ${hu.id}…`); await completarHU(s, hu, material, !!prev.subs?.length);
       }
     }
     await Store.guardar(s); toast('Ajuste aplicado', 'ok');
@@ -2219,8 +2330,8 @@ function abrirConfig() {
     <label class="f">API key de Groq ${CONFIG_FIJO.groqKey ? '<span>· integrada</span>' : '<span>· gratis en console.groq.com → API Keys</span>'}</label>
     <div class="row"><input type="password" id="cGroq" value="${esc(cfg.groqKey)}" placeholder="gsk_..." style="flex:1" ${fijo('groqKey')}><button class="btn sm" data-action="probarGroq">${ic('bolt')}Probar</button></div>
     <div class="grid2">
-      <div><label class="f">Modelo del agente</label><select id="cModelo">${[...new Set([cfg.modeloTexto, ...PREF_TEXTO])].map(m => `<option ${m === cfg.modeloTexto ? 'selected' : ''}>${m}</option>`).join('')}</select>
-        <div class="small muted" style="margin-top:6px">Si el modelo elegido no está disponible en tu cuenta, la app usa otro automáticamente.</div></div>
+      <div><label class="f">Modelo del agente</label><select id="cModelo">${[['', 'Automático (recomendado)'], ...['openai/gpt-oss-120b', 'openai/gpt-oss-20b', ...[...(MODELOS || [])].filter(m => /qwen/.test(m)), 'llama-3.3-70b-versatile'].map(m => [m, m])].filter((x, i, a) => a.findIndex(y => y[0] === x[0]) === i).map(([v, l]) => `<option value="${v}" ${v === (cfg.modeloTexto || '') ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <div class="small muted" style="margin-top:6px">En automático, cada tarea usa un modelo distinto para repartir los cupos diarios del plan gratuito.</div></div>
       <div><label class="f">Modelo de transcripción</label><select id="cAudio">${['whisper-large-v3', 'whisper-large-v3-turbo'].map(m => `<option ${m === cfg.modeloAudio ? 'selected' : ''}>${m}</option>`).join('')}</select>
         <div class="small muted" style="margin-top:6px">v3: más preciso en español. Turbo: más rápido.</div></div>
     </div>
@@ -2249,7 +2360,7 @@ async function guardarConfigUI() {
 }
 async function probarGroq() {
   const k = CONFIG_FIJO.groqKey || $('#cGroq').value.trim(); if (!k) return toast('Pegá la API key.');
-  try { const r = await fetch('https://api.groq.com/openai/v1/models', { headers: { Authorization: 'Bearer ' + k } }); if (!r.ok) throw new Error('Key inválida (' + r.status + ')'); MODELOS = null; const m = await modeloTexto(); toast('Groq conectado · agente: ' + m, 'ok', 5000); }
+  try { const r = await fetch('https://api.groq.com/openai/v1/models', { headers: { Authorization: 'Bearer ' + k } }); if (!r.ok) throw new Error('Key inválida (' + r.status + ')'); MODELOS = null; NO_USAR.clear(); const [a, b, c] = await Promise.all([modeloPara('redaccion'), modeloPara('vivo'), modeloPara('resumen')]); toast(`Groq conectado · historias: ${a} · en vivo: ${b} · notas: ${c}`, 'ok', 7000); }
   catch (e) { toast('No conecta: ' + e.message, 'error'); }
 }
 
@@ -2335,7 +2446,7 @@ const acciones = {
     const s = S, i = +el.dataset.i, hu = s.resultado.historias[i];
     if (hu.subs?.length && !confirm('Se rehacen las sub-historias de ' + hu.id + ' y se pierden las ediciones. ¿Seguimos?')) return;
     GEN = { activo: true, sid: s.id, msg: `Armando sub-historias de ${hu.id}…` }; renderSesion();
-    try { const modelo = await modeloTexto(), T = tpmDe(modelo); hu.subs = await redactarSubs(s, modelo, Math.min(6000, Math.floor(T * 0.45)), hu); await Store.guardar(s); toast('Sub-historias listas', 'ok'); }
+    try { hu.subs = await redactarSubs(s, null, null, hu); await Store.guardar(s); toast('Sub-historias listas', 'ok'); }
     catch (e) { toast('No se pudieron armar: ' + e.message, 'error', 7000); }
     GEN = { activo: false, msg: '' }; if (S === s) renderSesion();
   },
