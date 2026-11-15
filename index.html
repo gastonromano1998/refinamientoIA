@@ -578,7 +578,7 @@ const Store = {
   },
   async guardar(s) {
     s.actualizado = Date.now(); CACHE[s.id] = s;
-    const data = clone({ ...s, imagenes: undefined, _imgsCargadas: undefined, _vivoCola: undefined, _previa: undefined, _buf: undefined, _material: undefined });
+    const data = clone({ ...s, _revisando: undefined, imagenes: undefined, _imgsCargadas: undefined, _vivoCola: undefined, _previa: undefined, _buf: undefined, _material: undefined });
     if (this.modo === 'firebase') await this.db.ref(DB_ROOT + '/sesiones/' + s.id).set(data);
     else { const all = this._localAll(); all[s.id] = data; this._localSet(all); }
   },
@@ -620,6 +620,7 @@ function normSesion(s) {
     analisisDiseno: s.analisisDiseno || '', transcripcion: s.transcripcion || '', notas: arr(s.notas),
     modoGrabacion: s.modoGrabacion || (navigator.mediaDevices?.getDisplayMedia ? 'virtual' : 'presencial'),
     consentimiento: !!s.consentimiento, duracionGrabada: s.duracionGrabada || 0, cantImagenes: s.cantImagenes || 0,
+    resumenWebex: s.resumenWebex || '', revisarActivo: s.revisarActivo !== false,
     vivo: normVivo(s.vivo), vivoActivo: s.vivoActivo !== false, notasBloques: arr(s.notasBloques).filter(n => n && n.texto), notasChars: +s.notasChars || 0,
     subActivas: s.subActivas !== false, subEquipos: arr(s.subEquipos).length ? arr(s.subEquipos) : EQUIPOS.map(e => e.k),
     resultado: s.resultado ? normRes(s.resultado) : null
@@ -676,6 +677,7 @@ function normHU(h, i) {
     preguntas: arr(h.preguntas).map(p => typeof p === 'string' ? { pregunta: p, responsable: '', estado: 'Abierta' } : { pregunta: T(p.pregunta), responsable: T(p.responsable), estado: T(p.estado) || 'Abierta' }).filter(p => p.pregunta),
     citas: L(h.citas),
     checklist: { puntaje, falta: T(ck.falta), partir: T(ck.partir) },
+    revision: h.revision && typeof h.revision === 'object' ? { fecha: +h.revision.fecha || 0, correcciones: L(h.revision.correcciones) } : null,
     subs: arr(h.subs).map(normSub).filter(Boolean)
   };
 }
@@ -1269,7 +1271,7 @@ async function actualizarVivo(s, fragmento, etiqueta) {
   refrescarVivo(s);
 }
 async function vivoDesdeTranscripcion(s) {
-  const t = s.transcripcion.trim(); if (!t) return toast('No hay transcripción todavía.');
+  const t = s.transcripcion.trim() || (s.resumenWebex || '').trim(); if (!t) return toast('No hay transcripción ni resumen de Webex todavía.');
   if (s.vivo && !confirm('Se rehace el borrador en vivo desde cero con toda la transcripción. ¿Seguimos?')) return;
   s.vivo = null; s.notasBloques = []; s.notasChars = 0; s._buf = []; VIVO_UI[s.id] = { estado: 'run', msg: 'Preparando…' }; refrescarVivo(s);
   const partes = partir(t, 9000);
@@ -1306,7 +1308,7 @@ function panelVivo(s) {
     : ui.estado === 'error' ? `<span class="chip err">${esc(ui.msg)}</span>`
       : v ? `<span class="chip ok">${ic('check')}Actualizado ${new Date(v.actualizado).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })} · ${v.tramos} ${v.tramos === 1 ? 'actualización' : 'actualizaciones'}</span>` : '';
   const head = `<div class="chead"><div><h3><span class="dot ${grabando ? 'rec' : v ? 'live' : ''}"></span>Historia en vivo</h3><p class="sub">${s.vivoActivo === false ? 'Desactivada: activala en la tarjeta de grabación.' : grabando ? 'Se actualiza sola con cada tramo de la reunión (cada 3 minutos). Lo nuevo aparece resaltado.' : 'Se arma mientras grabás. También podés armarla con una transcripción pegada o importada.'}</p></div>
-      <div class="row" style="gap:6px">${estado}${v ? `<button class="btn sm" data-action="copiarVivo">${ic('copy')}Copiar</button>` : ''}${!grabando && s.transcripcion.trim() ? `<button class="btn sm" data-action="vivoTodo" ${ui.estado === 'run' ? 'disabled' : ''}>${ic('refresh')}${v ? 'Rehacer' : 'Armar'} con la transcripción</button>` : ''}</div></div>`;
+      <div class="row" style="gap:6px">${estado}${v ? `<button class="btn sm" data-action="copiarVivo">${ic('copy')}Copiar</button>` : ''}${!grabando && (s.transcripcion.trim() || (s.resumenWebex || '').trim()) ? `<button class="btn sm" data-action="vivoTodo" ${ui.estado === 'run' ? 'disabled' : ''}>${ic('refresh')}${v ? 'Rehacer' : 'Armar'} con la transcripción</button>` : ''}</div></div>`;
   if (!v) return `<div class="card vivo" id="vivo">${head}<div class="vivo-empty">${ic('spark', 'lg')}<span>${grabando ? 'Esperando el primer tramo de la reunión…' : 'Todavía no hay borrador.'}</span></div></div>`;
   const ca = c => `<li class="${nv(c.entonces)}"><div class="sc"><em>${esc(c.id)}</em>${esc(c.escenario || '')}</div>${c.dado ? `<div><span class="k d">Dado que</span>${esc(c.dado)}</div>` : ''}${c.cuando ? `<div><span class="k c">Cuando</span>${esc(c.cuando)}</div>` : ''}<div><span class="k e">Entonces</span>${esc(c.entonces)}</div></li>`;
   return `<div class="card vivo" id="vivo">${head}
@@ -1335,6 +1337,167 @@ function panelVivo(s) {
   </div>`;
 }
 
+/* =====================================================================
+   REVISOR DE CALIDAD: un segundo agente revisa cada HU contra el checklist
+   del esqueleto de Tokin y corrige huecos sin inventar datos.
+   ===================================================================== */
+function sysRevisor(s) {
+  return sysBase(s) + `
+
+TAREA: sos el REVISOR DE CALIDAD de Producto. Recibís una historia de usuario ya redactada (resumida) y el material de la reunión. Revisala contra el checklist y las reglas de redacción del esqueleto de Tokin y CORREGILA directamente:
+- El "para" expresa un beneficio real de negocio o del PDV.
+- Reglas RN-XX verificables: montos, cantidades, vigencias, topes, unidades y países explícitos. Si el dato no está en la reunión: [A DEFINIR] y una pregunta.
+- Criterios CA-XX en Gherkin: al menos 1 camino feliz + 1 alternativo + 1 error/borde; cada CA prueba una sola cosa y cita RN-XX.
+- "rol" es el actor real, nunca "el sistema". Fuera de alcance explícito. Nada ambiguo ("rápido", "fácil", "intuitivo", "etc.").
+- Las dudas sin respuesta van a preguntas con responsable.
+- Mantené la numeración existente; agregá al final lo nuevo. No inventes reglas ni números que no surjan del material.
+- Recalculá el checklist (para qué 15 · reglas 20 · CA 20 · UX 10 · Front/Back 10 · QA 10 · medición 5 · fuera de alcance 5 · preguntas 5).
+- "correcciones": qué cambiaste, una línea cada una (máximo 6). Si no hacía falta corregir nada, [].
+
+ESQUEMA:
+{"titulo":"","rol":"","quiero":"","para":"","incluye":[""],"fuera_de_alcance":[""],"reglas":[{"id":"RN-01","texto":""}],
+"criterios":[{"id":"CA-01","escenario":"","dado":"","cuando":"","entonces":"","y":[""]}],
+"preguntas":[{"pregunta":"","responsable":"","estado":"Abierta"}],"checklist":{"puntaje":0,"falta":"","partir":"No"},"correcciones":[""]}`;
+}
+async function revisarHU(s, hu, material) {
+  const resumen = { ...huCompacta(hu), equipos: { ux: [...hu.ux.pantallas, ...hu.ux.estados, ...hu.ux.textos].slice(0, 8), front: [...hu.front.componentes, ...hu.front.logica].slice(0, 6), back: [...hu.back.endpoints, ...hu.back.datos].slice(0, 6), qa: hu.qa.casos.slice(0, 6) }, medicion: hu.medicion.kpi, checklist_actual: hu.checklist };
+  const sys = sysRevisor(s), base = `${contextoTexto(s, false)}\n\nHISTORIA A REVISAR (${hu.id}):\n${JSON.stringify(resumen)}`;
+  const libre = 8000 - 2300 - estimTokens(sys + base) - 500;
+  const r = await chat([{ role: 'system', content: sys }, { role: 'user', content: `${base}\n\n${recortar(material, Math.max(400, libre))}` }], { onWait: setGen, max: 2300, rol: 'redaccion' });
+  const idx = Math.max(0, s.resultado.historias.indexOf(hu));
+  const m = normHU({ ...hu, ...r }, idx);
+  ['titulo', 'rol', 'quiero', 'para', 'incluye', 'fuera_de_alcance', 'reglas', 'criterios', 'preguntas', 'checklist', 'estado'].forEach(k => { if (k === 'reglas' && !m.reglas.length) return; if (k === 'criterios' && !m.criterios.length) return; hu[k] = m[k]; });
+  hu.revision = { fecha: Date.now(), correcciones: arr(r.correcciones).map(toStr).map(t => t.trim()).filter(Boolean).slice(0, 6) };
+}
+
+/* =====================================================================
+   RESPALDO DEL AUDIO: cada tramo se guarda en la compu (IndexedDB) mientras
+   se graba y hasta que se transcribe. Si se corta internet, Groq falla o se
+   cierra el navegador, el audio queda para recuperarlo.
+   ===================================================================== */
+const IDB = {
+  db: null,
+  async abrir() {
+    if (this.db) return this.db;
+    this.db = await new Promise((res, rej) => { const r = indexedDB.open('refinamiento-audio', 1); r.onupgradeneeded = () => r.result.createObjectStore('tramos', { keyPath: 'key' }); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    return this.db;
+  },
+  async op(modo, fn) { const db = await this.abrir(); return new Promise((res, rej) => { const tx = db.transaction('tramos', modo), st = tx.objectStore('tramos'); const q = fn(st); tx.oncomplete = () => res(q?.result); tx.onerror = () => rej(tx.error); }); },
+  put(v) { return this.op('readwrite', st => st.put(v)).catch(e => console.warn('respaldo', e)); },
+  del(k) { return this.op('readwrite', st => st.delete(k)).catch(() => { }); },
+  todos() { return this.op('readonly', st => st.getAll()).catch(() => []); }
+};
+let PENDIENTES_AUDIO = [];
+async function revisarRespaldos() {
+  const activos = REC.activo ? REC.claveBase : null;
+  PENDIENTES_AUDIO = (await IDB.todos() || []).filter(t => !activos || !t.key.startsWith(activos));
+  return PENDIENTES_AUDIO;
+}
+function avisoRespaldo(sid) {
+  const p = PENDIENTES_AUDIO.filter(t => !sid || t.sid === sid); if (!p.length) return '';
+  const mins = Math.round(p.reduce((a, t) => a + (t.dur || 180000), 0) / 60000);
+  return `<div class="notice" style="margin-bottom:16px">${ic('bolt')} <span>Hay <b>${p.length} ${p.length === 1 ? 'tramo' : 'tramos'} de audio (~${mins} min)</b> guardados en esta compu sin transcribir${sid ? '' : ` (${[...new Set(p.map(t => t.titulo))].map(esc).join(', ')})`}. Pasa si se cortó internet o se cerró el navegador durante una grabación.</span><button class="btn sm primary" data-action="recuperarAudio" ${sid ? `data-sid="${sid}"` : ''}>${ic('refresh')}Recuperar y transcribir</button><button class="btn sm ghost" data-action="descartarAudio" ${sid ? `data-sid="${sid}"` : ''}>Descartar</button></div>`;
+}
+async function recuperarAudio(sid) {
+  const lista = (await revisarRespaldos()).filter(t => !sid || t.sid === sid).sort((a, b) => a.creado - b.creado || a.idx - b.idx);
+  if (!lista.length) return toast('No hay audio pendiente.');
+  let ok = 0;
+  for (const t of lista) {
+    const s = await Store.obtener(t.sid);
+    if (!s) { await IDB.del(t.key); continue; }
+    toast(`Transcribiendo tramo ${t.idx + 1} de "${s.titulo}"…`, '', 4000);
+    try {
+      const segs = await transcribirDetalle(t.blob, `recuperado-${t.idx + 1}.${t.ext || 'webm'}`);
+      const base = (t.offset || 0) / 1000;
+      const txt = segs.map(g => `[${fmtT((base + g.start) * 1000)}] ${g.text}`).join('\n');
+      if (txt) { s.transcripcion = [s.transcripcion.trim(), `[Audio recuperado · tramo ${t.idx + 1}]\n${txt}`].filter(Boolean).join('\n\n'); encolarVivo(s, txt, `tramo ${t.idx + 1} (recuperado)`, true); }
+      await Store.guardar(s); await IDB.del(t.key); ok++;
+    } catch (e) { toast('No se pudo transcribir un tramo: ' + e.message + '. Queda guardado para reintentar.', 'error', 7000); break; }
+  }
+  await revisarRespaldos();
+  if (ok) toast(`${ok} ${ok === 1 ? 'tramo recuperado' : 'tramos recuperados'} y agregados a la transcripción`, 'ok', 6000);
+  render();
+}
+
+/* =====================================================================
+   EXPORTAR A WORD (.docx) — se arma en el navegador, sin servicios externos.
+   ===================================================================== */
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+const crc32 = b => { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC_T[(c ^ b[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+function zipStore(files) {
+  const enc = new TextEncoder(), partes = [], central = []; let off = 0;
+  for (const f of files) {
+    const nombre = enc.encode(f.name), data = typeof f.data === 'string' ? enc.encode(f.data) : f.data, crc = crc32(data);
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true); h.setUint32(10, 0, true);
+    h.setUint32(14, crc, true); h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, nombre.length, true); h.setUint16(28, 0, true);
+    partes.push(new Uint8Array(h.buffer), nombre, data);
+    const c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true); c.setUint16(10, 0, true); c.setUint32(12, 0, true);
+    c.setUint32(16, crc, true); c.setUint32(20, data.length, true); c.setUint32(24, data.length, true); c.setUint16(28, nombre.length, true);
+    c.setUint16(30, 0, true); c.setUint16(32, 0, true); c.setUint16(34, 0, true); c.setUint16(36, 0, true); c.setUint32(38, 0, true); c.setUint32(42, off, true);
+    central.push(new Uint8Array(c.buffer), nombre);
+    off += 30 + nombre.length + data.length;
+  }
+  const cdSize = central.reduce((a, x) => a + x.length, 0), e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, cdSize, true); e.setUint32(16, off, true);
+  return new Blob([...partes, ...central, new Uint8Array(e.buffer)], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+}
+const xesc = t => String(t ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+function runsW(texto, extra = '') {
+  return texto.split(/(\*\*[^*]+\*\*|_[^_]+_)/g).filter(Boolean).map(seg => {
+    const b = /^\*\*.*\*\*$/.test(seg), i = /^_.*_$/.test(seg) && seg.length > 2, t = b ? seg.slice(2, -2) : i ? seg.slice(1, -1) : seg;
+    return `<w:r><w:rPr>${b ? '<w:b/>' : ''}${i ? '<w:i/>' : ''}${extra}</w:rPr><w:t xml:space="preserve">${xesc(t)}</w:t></w:r>`;
+  }).join('');
+}
+function mdADocx(md) {
+  const P = [];
+  for (const raw of md.split('\n')) {
+    const l = raw.replace(/\s+$/, '');
+    if (!l.trim()) { P.push('<w:p/>'); continue; }
+    let m;
+    if ((m = l.match(/^(#{1,4})\s+(.*)$/))) { const n = Math.min(m[1].length, 3); P.push(`<w:p><w:pPr><w:pStyle w:val="Heading${n}"/></w:pPr>${runsW(m[2])}</w:p>`); continue; }
+    if (/^\|\s*-+/.test(l)) continue;
+    if (l.startsWith('|')) { P.push(`<w:p><w:pPr><w:ind w:left="360"/></w:pPr>${runsW(l.split('|').map(x => x.trim()).filter(Boolean).join('  ·  '))}</w:p>`); continue; }
+    if ((m = l.match(/^(\s*)- \[ \] (.*)$/))) { P.push(`<w:p><w:pPr><w:ind w:left="${360 + m[1].length * 180}" w:hanging="280"/></w:pPr>${runsW('☐ ' + m[2])}</w:p>`); continue; }
+    if ((m = l.match(/^(\s*)[-•] (.*)$/))) { P.push(`<w:p><w:pPr><w:ind w:left="${360 + m[1].length * 180}" w:hanging="220"/></w:pPr>${runsW('• ' + m[2])}</w:p>`); continue; }
+    if ((m = l.match(/^(\s+)(Dado que|Cuando|Entonces|Y)\b(.*)$/))) { P.push(`<w:p><w:pPr><w:ind w:left="540"/></w:pPr><w:r><w:rPr><w:b/><w:color w:val="B0106A"/></w:rPr><w:t xml:space="preserve">${xesc(m[2])}</w:t></w:r>${runsW(m[3])}</w:p>`); continue; }
+    if ((m = l.match(/^((?:RN|CA|CP)-[A-Z]*-?\d+)(.*)$/))) { P.push(`<w:p><w:r><w:rPr><w:b/><w:color w:val="B0106A"/></w:rPr><w:t xml:space="preserve">${xesc(m[1])}</w:t></w:r>${runsW(m[2])}</w:p>`); continue; }
+    if (l === '---') { P.push('<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="E6198A"/></w:pBdr></w:pPr></w:p>'); continue; }
+    P.push(`<w:p>${runsW(l)}</w:p>`);
+  }
+  return P.join('');
+}
+async function exportarWord(s = S) {
+  const md = minutaMarkdown(s);
+  let logo = null, lw = 0, lh = 0;
+  try {
+    const img = document.querySelector('.brand img.ld');
+    if (img?.src?.startsWith('data:image/png;base64,')) { logo = Uint8Array.from(atob(img.src.split(',')[1]), c => c.charCodeAt(0)); lw = img.naturalWidth; lh = img.naturalHeight; }
+  } catch { }
+  const anchoEmu = 1600000, altoEmu = lw ? Math.round(anchoEmu * lh / lw) : 0;
+  const logoXml = logo ? `<w:p><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${anchoEmu}" cy="${altoEmu}"/><wp:docPr id="1" name="Tokin"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="1" name="logo.png"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdLogo"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${anchoEmu}" cy="${altoEmu}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>` : '';
+  const sub = `<w:p><w:r><w:rPr><w:color w:val="7D6279"/><w:sz w:val="18"/></w:rPr><w:t xml:space="preserve">Refinamiento IA · Producto Digital · generado el ${xesc(new Date().toLocaleString('es-AR'))}</w:t></w:r></w:p>`;
+  const doc = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><w:body>${logoXml}${sub}${mdADocx(md)}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="567" w:footer="567" w:gutter="0"/></w:sectPr></w:body></w:document>`;
+  const estilos = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:sz w:val="21"/><w:lang w:val="es-AR"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="60" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="360" w:after="120"/><w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:b/><w:color w:val="22092A"/><w:sz w:val="34"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="240" w:after="80"/><w:outlineLvl w:val="1"/></w:pPr><w:rPr><w:b/><w:color w:val="E6198A"/><w:sz w:val="26"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="200" w:after="60"/><w:outlineLvl w:val="2"/></w:pPr><w:rPr><w:b/><w:color w:val="4A3148"/><w:sz w:val="23"/></w:rPr></w:style></w:styles>`;
+  const files = [
+    { name: '[Content_Types].xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>` },
+    { name: '_rels/.rels', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>` },
+    { name: 'word/_rels/document.xml.rels', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>${logo ? '<Relationship Id="rIdLogo" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/logo.png"/>' : ''}</Relationships>` },
+    { name: 'word/document.xml', data: doc },
+    { name: 'word/styles.xml', data: estilos }
+  ];
+  if (logo) files.push({ name: 'word/media/logo.png', data: logo });
+  const blob = zipStore(files), a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = `historias-${slug(s.titulo)}.docx`; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+  toast('Word listo: historias, sub-historias y minuta', 'ok');
+  return blob;
+}
+
 /* ---------------- estado de la UI ---------------- */
 let S = null, VISTA = 'lista', TAB = 'contexto';
 let GEN = { activo: false, msg: '' };
@@ -1357,6 +1520,7 @@ async function renderLista() {
       </div>
       <button class="btn primary" data-action="new">${ic('plus')}Nueva sesión</button>
     </div>
+    ${avisoRespaldo()}
     ${!cfg.groqKey ? `<div class="notice" style="margin-bottom:18px">${ic('bolt')} Para grabar y generar historias falta conectar el agente. <button class="btn sm primary" data-action="config">Configurar Groq</button></div>` : ''}
     <div class="kpis rv" id="kpis">${[0, 1, 2, 3].map(() => `<div class="card kpi"><div class="lbl">…</div><div class="val">–</div></div>`).join('')}</div>
     <div class="toolbar">
@@ -1613,6 +1777,7 @@ function tabReunion() {
   $('#tabbody').innerHTML = `
     <div class="card">
       <div class="chead"><div><h3><span class="petal"></span>Grabar la reunión</h3><p class="sub">La transcripción y la historia en vivo se actualizan cada 3 minutos mientras grabás.</p></div></div>
+      ${avisoRespaldo(s.id)}
       ${otra ? `<div class="notice err" style="margin-bottom:14px">${ic('bolt')} Hay otra sesión grabando. Detenela antes de grabar acá.</div>` : ''}
       <div class="modes">
         <button class="mode ${s.modoGrabacion === 'virtual' ? 'on' : ''}" data-action="modo" data-v="virtual" ${grabando || !soportaVirtual ? 'disabled' : ''}>
@@ -1657,6 +1822,7 @@ function tabReunion() {
         <div class="row">
           <span class="chip gray" id="wc">${palabras(s.transcripcion)} palabras</span>
           <label class="btn sm" style="cursor:pointer">${ic('up')}Subir audio<input type="file" id="fileAudio" accept="audio/*,video/webm,video/mp4,.m4a,.mp3,.wav,.ogg,.webm" hidden></label>
+          <button class="btn sm ${(s.resumenWebex || '').trim() ? 'primary' : ''}" data-action="resumenWebex" title="Pegar lo que resumió el asistente de Webex">${ic((s.resumenWebex || '').trim() ? 'check' : 'note')}Resumen de Webex</button>
           <label class="btn sm" style="cursor:pointer" title="Transcripción de Webex, Teams o Meet (.vtt, .srt o .txt)">${ic('doc')}Importar .vtt<input type="file" id="fileVtt" accept=".vtt,.srt,.txt,text/vtt,text/plain" hidden></label>
           ${s.transcripcion ? `<button class="btn sm" data-action="dlTrans">${ic('down')}.txt</button>` : ''}
         </div>
@@ -1742,7 +1908,8 @@ async function iniciarGrabacion() {
       const mute = ctx.createGain(); mute.gain.value = 0;
       merger.connect(sp); sp.connect(mute); mute.connect(ctx.destination);
     }
-    REC = { activo: true, sid: S.id, sesion: S, inicio: Date.now(), base: (S.transcripcion || '').trim(), segs: [], offsets: [], ctxOffsets: [], estadoSegs: [], fallidos: {}, idx: 0, ctx, ctx0, dest, analyser, streams, sp, frames, etiquetar: !!(disp && mic), etiqueta: miEtiqueta(), voces, pcm, detalle: !!(disp && mic) || voces.length > 0, cola: Promise.resolve(), mime: pickMime() };
+    REC = { activo: true, sid: S.id, sesion: S, inicio: Date.now(), base: (S.transcripcion || '').trim(), segs: [], offsets: [], ctxOffsets: [], estadoSegs: [], fallidos: {}, idx: 0, ctx, ctx0, dest, analyser, streams, sp, frames, etiquetar: !!(disp && mic), etiqueta: miEtiqueta(), voces, pcm, detalle: !!(disp && mic) || voces.length > 0, cola: Promise.resolve(), mime: pickMime(), claves: [] };
+    REC.claveBase = `${S.id}|${REC.inicio}|`;
     nuevoSegmento(REC);
     REC.timerSeg = setInterval(() => rotarSegmento(REC), SEG_MS);
     REC.tick = setInterval(() => { const r = $('#reloj'); if (r && REC.activo && S?.id === REC.sid) r.textContent = fmtT(Date.now() - REC.inicio); }, 500);
@@ -1755,10 +1922,15 @@ function nuevoSegmento(R) {
   const opts = { audioBitsPerSecond: 32000 }; if (R.mime) opts.mimeType = R.mime;
   const rec = new MediaRecorder(R.dest.stream, opts);
   R.estadoSegs[idx] = 'grabando'; R.offsets[idx] = offset; R.ctxOffsets[idx] = R.ctx.currentTime - R.ctx0;
+  const key = R.claveBase + idx, meta = { key, sid: R.sid, titulo: R.sesion.titulo, idx, offset, creado: Date.now(), ext: extDe(rec.mimeType || R.mime || 'audio/webm') };
+  R.claves[idx] = key;
   rec.ondataavailable = e => { if (e.data?.size) chunks.push(e.data); };
+  const respaldo = setInterval(() => { if (chunks.length) IDB.put({ ...meta, dur: Date.now() - R.inicio - offset, blob: new Blob(chunks, { type: rec.mimeType || R.mime || 'audio/webm' }) }); }, 20000);
   rec.onstop = () => {
+    clearInterval(respaldo);
     const tipo = rec.mimeType || R.mime || 'audio/webm';
     const blob = new Blob(chunks, { type: tipo });
+    if (blob.size >= 3000) IDB.put({ ...meta, dur: Date.now() - R.inicio - offset, blob });
     R.estadoSegs[idx] = 'pendiente'; refrescarRecUI();
     R.cola = R.cola.then(() => procesarSegmento(R, idx, blob, extDe(tipo)));
     rec._done?.();
@@ -1769,11 +1941,11 @@ function nuevoSegmento(R) {
 function rotarSegmento(R) { if (!R.activo) return; const viejo = R.rec; nuevoSegmento(R); viejo.stop(); }
 async function procesarSegmento(R, idx, blob, ext) {
   R.estadoSegs[idx] = 'transcribiendo'; refrescarRecUI();
-  if (blob.size < 3000) { R.segs[idx] = ''; R.estadoSegs[idx] = 'ok'; refrescarRecUI(); return; }
+  if (blob.size < 3000) { R.segs[idx] = ''; R.estadoSegs[idx] = 'ok'; if (R.claves?.[idx]) IDB.del(R.claves[idx]); refrescarRecUI(); return; }
   try {
     if (blob.size > 24.5e6) throw new Error('tramo demasiado grande');
     R.segs[idx] = R.detalle ? await etiquetarSegmentos(R, idx, await transcribirDetalle(blob, `tramo-${idx + 1}.${ext}`)) : await transcribir(blob, `tramo-${idx + 1}.${ext}`);
-    R.estadoSegs[idx] = 'ok'; delete R.fallidos[idx];
+    R.estadoSegs[idx] = 'ok'; delete R.fallidos[idx]; if (R.claves?.[idx]) IDB.del(R.claves[idx]);
   } catch (e) { R.estadoSegs[idx] = 'error'; R.fallidos[idx] = { blob, ext }; toast(`Tramo ${idx + 1}: ${e.message}`, 'error', 6000); }
   armarTranscripcion(R); refrescarRecUI();
   if (R.segs[idx]) encolarVivo(R.sesion, R.segs[idx], `tramo ${idx + 1}`);
@@ -1925,7 +2097,7 @@ const NA = 'No aplica';
 const vacio = v => Array.isArray(v) ? !v.filter(x => x && x !== NA).length : !v || v === NA;
 function tabHistorias() {
   const s = S, r = s.resultado;
-  const tieneMaterial = s.transcripcion.trim() || s.notas.length;
+  const tieneMaterial = s.transcripcion.trim() || s.notas.length || (s.resumenWebex || '').trim();
   const chk = (ok, txt, warn) => `<div><span class="ck ${ok ? 'on' : ''}">${ok ? ic('check') : ''}</span><span class="${ok ? '' : 'muted'}">${txt}</span>${!ok && warn ? `<span class="chip y" style="margin-left:auto">${warn}</span>` : ''}</div>`;
   const generando = GEN.activo && GEN.sid === s.id;
   const banner = generando ? `<div class="card ins" style="margin-bottom:16px"><div class="genstatus" style="margin:0"><div class="spin"></div><span id="genmsg">${esc(GEN.msg)}</span></div><p class="small muted" style="margin:8px 0 0">Con el plan gratuito de Groq cada historia puede tardar hasta un minuto. Podés seguir trabajando en otra pestaña.</p></div>` : '';
@@ -1934,11 +2106,13 @@ function tabHistorias() {
       <div class="chead"><div><h3><span class="petal"></span>Generar historias con el esqueleto de Tokin</h3><p class="sub">13 secciones por historia: contexto, alcance, RN, CA en Gherkin, UX, IT Front, IT Back, QA, medición, dependencias, preguntas y DoR/DoD.</p></div></div>
       <div class="checks">
         ${chk(s.transcripcion.trim(), `Transcripción${s.transcripcion.trim() ? ` · ${palabras(s.transcripcion)} palabras` : ' (o pegá / importá la de Webex en el paso 2)'}`)}
+        ${chk((s.resumenWebex || '').trim(), (s.resumenWebex || '').trim() ? `Resumen del asistente de Webex · ${palabras(s.resumenWebex)} palabras` : 'Resumen del asistente de Webex (opcional, se pega en el paso 2)')}
         ${chk(s.contexto.criterio, 'Criterio de negocio (opcional)')}
         ${chk((s.imagenes || []).length || s.contexto.figma.length, 'Diseño (opcional: capturas o links de Figma)')}
         ${s.previaId ? chk(s._previa?.resultado?.historias?.length || s._previa?.vivo, s._previa?.resultado?.historias?.length ? `Historias de la Parte ${s._previa.parte || 1}: ${s._previa.resultado.historias.length} (se actualizan con lo de hoy)` : 'Sesión anterior (se continúa desde su borrador)') : ''}
       </div>
       <div class="subcfg">
+        <label class="row" style="gap:10px;cursor:pointer;margin-bottom:10px"><input type="checkbox" data-bind-check="revisarActivo" ${s.revisarActivo !== false ? 'checked' : ''} style="accent-color:var(--tk);width:16px;height:16px"><b>Revisor de calidad automático</b> <span class="small muted">· un segundo agente revisa cada HU contra tu checklist y corrige huecos</span></label>
         <label class="row" style="gap:10px;cursor:pointer"><input type="checkbox" data-bind-check="subActivas" ${s.subActivas !== false ? 'checked' : ''} style="accent-color:var(--tk);width:16px;height:16px"><b>Abrir cada historia en sub-historias por equipo</b></label>
         <div class="row" style="margin-top:8px">${EQUIPOS.map(e => `<button class="toggle ${(s.subEquipos || EQUIPOS.map(x => x.k)).includes(e.k) ? 'on' : ''}" data-action="subEq" data-v="${e.k}">${e.nombre}</button>`).join('')}</div>
         <div class="small muted" style="margin-top:6px">Una sub-historia por equipo (con tareas y criterios propios), lista para cargar como sub-tarea en Jira. Si la iniciativa no toca el Admin, queda como "No aplica".</div>
@@ -1983,7 +2157,8 @@ function tabHistorias() {
       <span class="sum"><b>${H.length}</b> historias · <b>${H.filter(h => h.estado !== 'Borrador').length}</b> listas para refinar · <b>${r.dudas_abiertas.length + H.reduce((a, h) => a + h.preguntas.length, 0)}</b> preguntas</span>
       <div class="row" style="gap:6px">
         <button class="btn sm" data-action="copiarTodo">${ic('copy')}<span class="lbl">Copiar todo</span></button>
-        <button class="btn sm" data-action="dlMd">${ic('doc')}<span class="lbl">Documento .md</span></button>
+        <button class="btn sm" data-action="dlWord">${ic('doc')}<span class="lbl">Word</span></button>
+        <button class="btn sm" data-action="dlMd">${ic('doc')}<span class="lbl">.md</span></button>
         <button class="btn sm primary" data-action="dlCsv">${ic('down')}CSV para Jira</button>
       </div>
     </div>`;
@@ -2004,7 +2179,7 @@ function tarjetaHistoria(h, i) {
   const meta = [['Épica', h.epica], ['País', h.pais], ['Plataforma', h.plataforma], ['Objetivo', h.objetivo]].filter(x => x[1] && x[1] !== NA);
   return `<div class="card story">
     <div class="sh">
-      <span class="sid"><i>${h.id.slice(3)}</i>${h.id}<span class="chip ${est}">${esc(h.estado)}</span>${sc ? `<span class="chip ${scCls}" title="Puntaje del checklist de calidad">${sc}/100</span>` : ''}</span>
+      <span class="sid"><i>${h.id.slice(3)}</i>${h.id}<span class="chip ${est}">${esc(h.estado)}</span>${sc ? `<span class="chip ${scCls}" title="Puntaje del checklist de calidad">${sc}/100</span>` : ''}${h._revisando ? `<span class="chip y"><span class="spin" style="width:11px;height:11px;border-width:2px"></span>Revisando calidad…</span>` : h._pendiente ? `<span class="chip y"><span class="spin" style="width:11px;height:11px;border-width:2px"></span>Completando equipos…</span>` : h.revision ? `<span class="chip ok" title="Revisada por el agente revisor">${ic('check')}Revisada${h.revision.correcciones.length ? ` · ${h.revision.correcciones.length} correcciones` : ''}</span>` : ''}</span>
       <div class="row" style="gap:6px">
         <select data-prio="${i}" class="prio ${h.prioridad}">${['Alta', 'Media', 'Baja'].map(x => `<option ${x === h.prioridad ? 'selected' : ''}>${x}</option>`).join('')}</select>
         <button class="btn sm" data-action="copiarJira" data-i="${i}" title="Título + historia + criterios">${ic('copy')}Jira</button>
@@ -2052,6 +2227,7 @@ function tarjetaHistoria(h, i) {
       </details>
       ${sc || h.checklist.falta ? `<div class="score"><div class="bar"><div style="width:${sc}%"></div></div><div class="small"><b>Checklist ${sc}/100</b>${h.checklist.falta ? ` · Falta: <span contenteditable data-edit="${p}.checklist.falta">${esc(h.checklist.falta)}</span>` : ''}${h.checklist.partir && !/^no\b/i.test(h.checklist.partir) ? `<br><b>¿Partirla?</b> ${esc(h.checklist.partir)}` : ''}</div></div>` : ''}
       ${bloqueSubs(h, i)}
+      ${h.revision?.correcciones?.length ? `<details class="areas"><summary>${ic('chev')}Correcciones del revisor de calidad (${h.revision.correcciones.length})</summary><ul class="blist" style="--k:var(--qa);margin-top:10px">${h.revision.correcciones.map(c => `<li>${esc(c)}</li>`).join('')}</ul></details>` : ''}
       ${h.citas.map(c => `<div class="quote">“${esc(c)}”</div>`).join('')}
     </div>
   </div>`;
@@ -2111,8 +2287,15 @@ async function comprimirHasta(texto, presupuesto, etiqueta) {
   return `${etiqueta}:\n${recortar(texto, presupuesto)}`;
 }
 async function materialFinal(s, presupuesto = 2400) {
-  const t = s.transcripcion.trim();
-  const clave = `${t.length}|${(s.notasBloques || []).length}|${presupuesto}`;
+  const t = s.transcripcion.trim(), wx = (s.resumenWebex || '').trim();
+  const clave = `${t.length}|${(s.notasBloques || []).length}|${presupuesto}|${wx.length}`;
+  if (wx) {
+    if (s._material?.clave === clave) return s._material.texto;
+    const tw = Math.min(900, estimTokens(wx));
+    const base = (t || (s.notasBloques || []).length) ? await materialFinal({ ...s, resumenWebex: '', _material: null }, presupuesto - tw) : '';
+    const texto = `RESUMEN DEL ASISTENTE DE WEBEX (complementario: si difiere de la transcripción, manda la transcripción):\n${recortar(wx, tw)}${base ? '\n\n' + base : ''}`;
+    s._material = { clave, texto }; return texto;
+  }
   if (s._material?.clave === clave) return s._material.texto;
   let texto;
   if (!t && !(s.notasBloques || []).length) texto = 'TRANSCRIPCIÓN:\n(sin transcripción: usá las notas de Producto y el contexto)';
@@ -2185,6 +2368,11 @@ async function completarHU(s, hu, material, conSubs = s.subActivas !== false) {
     conSubs ? (async () => { try { hu.subs = await redactarSubs(s, null, null, hu); } catch (e) { toast(`${hu.id}: no se pudieron armar las sub-historias (${e.message})`, 'error', 7000); } })() : null
   ].filter(Boolean);
   await Promise.all(tareas);
+  if (s.revisarActivo !== false) {
+    hu._revisando = true; repintarHistorias(s);
+    try { await revisarHU(s, hu, material); } catch (e) { toast(`${hu.id}: el revisor de calidad no pudo terminar (${e.message})`, 'error', 7000); }
+    delete hu._revisando;
+  }
   delete hu._pendiente;
   await Store.guardar(s).catch(() => { }); repintarHistorias(s);
 }
@@ -2215,7 +2403,7 @@ async function generar() {
       s.resultado.historias.push(hu); await Store.guardar(s); repintarHistorias(s);
       pendientes.push(completarHU(s, hu, material));
     }
-    if (pendientes.length) { setGen('Completando equipos y sub-historias (Front, Back, Admin, UX)…'); await Promise.all(pendientes); }
+    if (pendientes.length) { setGen(`Completando equipos y sub-historias${s.revisarActivo !== false ? ' y revisando la calidad' : ''}…`); await Promise.all(pendientes); }
     toast(`Listo: ${s.resultado.historias.length} historias con el esqueleto de Tokin`, 'ok');
   } catch (e) { toast('No se pudo generar: ' + e.message, 'error', 9000); }
   GEN = { activo: false, msg: '' };
@@ -2457,6 +2645,20 @@ const acciones = {
   copiarHU: el => { const h = S.resultado.historias[+el.dataset.i]; copiar(huMarkdown(h), `${h.id} completa copiada (13 secciones)`); },
   subEq: el => { const v = el.dataset.v, L = S.subEquipos || EQUIPOS.map(e => e.k); S.subEquipos = L.includes(v) ? L.filter(x => x !== v) : EQUIPOS.map(e => e.k).filter(k => L.includes(k) || k === v); guardarLuego(); el.classList.toggle('on'); },
   continuar: () => continuarSesion(S),
+  dlWord: () => exportarWord(S),
+  recuperarAudio: el => recuperarAudio(el.dataset.sid),
+  descartarAudio: async el => { const sid = el.dataset.sid; if (!confirm('¿Descartar el audio guardado sin transcribir? No se puede recuperar después.')) return; for (const t of PENDIENTES_AUDIO.filter(t => !sid || t.sid === sid)) await IDB.del(t.key); await revisarRespaldos(); toast('Audio descartado'); render(); },
+  resumenWebex: () => {
+    $('#modal').innerHTML = `<div class="bg" data-action="cerrarModal"><div class="box">
+      <h2>Resumen del asistente de Webex</h2>
+      <p class="muted small" style="margin:0 0 12px">Pegá lo que resumió el asistente de Webex. El agente lo usa junto con la grabación (si hay diferencias, manda la transcripción). También sirve solo, si no grabaste.</p>
+      <textarea id="wxTexto" rows="14" placeholder="Pegá acá el resumen, los puntos clave o las tareas que generó Webex…">${esc(S.resumenWebex || '')}</textarea>
+      <div class="mfoot">${(S.resumenWebex || '').trim() ? `<button class="btn danger" data-action="wxQuitar">${ic('trash')}Quitar</button>` : ''}<button class="btn" data-action="cerrarModal">Cancelar</button><button class="btn primary" data-action="wxGuardar">${ic('check')}Guardar</button></div>
+    </div></div>`;
+    setTimeout(() => $('#wxTexto')?.focus(), 50);
+  },
+  wxGuardar: async () => { S.resumenWebex = $('#wxTexto').value.trim(); S._material = null; $('#modal').innerHTML = ''; await Store.guardar(S).catch(() => { }); toast(S.resumenWebex ? 'Resumen de Webex guardado' : 'Resumen quitado', 'ok'); renderSesion(); },
+  wxQuitar: async () => { S.resumenWebex = ''; S._material = null; $('#modal').innerHTML = ''; await Store.guardar(S).catch(() => { }); renderSesion(); },
   copiarVivo: () => copiar(vivoMarkdown(S), 'Borrador en vivo copiado'),
   vivoTodo: () => vivoDesdeTranscripcion(S),
   copiarSub: el => { const h = S.resultado.historias[+el.dataset.i], sb = h.subs[+el.dataset.j]; copiar(subMarkdown(h, sb), `${idSub(h, sb)} copiada`); },
@@ -2513,6 +2715,7 @@ window.addEventListener('resize', () => { if (!REC.activo && VISTA === 'sesion' 
   cargarConfig(); pintarBotonTema(); pintarStatus();
   await Store.init();
   try { VOCES = await Store.listarVoces(); } catch { VOCES = []; }
+  await revisarRespaldos().catch(() => { });
   render();
   if (!cfg.groqKey) setTimeout(abrirConfig, 400);
 })();
